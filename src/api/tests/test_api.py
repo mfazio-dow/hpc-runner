@@ -6,14 +6,15 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from harness import RunResult, init_db, store_run
+from harness import RunResult, init_db, start_writer, stop_writer, store_run
 
 from basic_restapi.fastapi_app import app
 
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    with TestClient(app) as c:
+        yield c
 
 
 def test_api_run_solvers_unknown_solver_returns_400(client):
@@ -104,27 +105,31 @@ def test_api_delete_runs(tmp_path):
     """DELETE /api/runs removes rows from the configured DB."""
     db = tmp_path / "del.db"
     init_db(db)
-    rid = store_run(
-        db,
-        RunResult(
-            job_name="j",
-            solver_name="sv",
-            system_name="sy",
-            returncode=0,
-            stdout="",
-            stderr="",
-            runtime_seconds=0.1,
-            timestamp="2026-01-01T00:00:00+00:00",
-            passed=True,
-            job_batch_uuid="batch-u",
-        ),
-    )
-    with patch("basic_restapi.fastapi_app.DB_PATH", db):
-        tc = TestClient(app)
-        r = tc.request("DELETE", "/api/runs", json={"ids": [rid, 999001]})
-        assert r.status_code == 200
-        assert r.json()["deleted"] == 1
-        assert tc.get(f"/api/runs/{rid}").status_code == 404
+    start_writer(db)
+    try:
+        rid = store_run(
+            db,
+            RunResult(
+                job_name="j",
+                solver_name="sv",
+                system_name="sy",
+                returncode=0,
+                stdout="",
+                stderr="",
+                runtime_seconds=0.1,
+                timestamp="2026-01-01T00:00:00+00:00",
+                passed=True,
+                job_batch_uuid="batch-u",
+            ),
+        )
+        with patch("basic_restapi.fastapi_app.DB_PATH", db):
+            tc = TestClient(app)
+            r = tc.request("DELETE", "/api/runs", json={"ids": [rid, 999001]})
+            assert r.status_code == 200
+            assert r.json()["deleted"] == 1
+            assert tc.get(f"/api/runs/{rid}").status_code == 404
+    finally:
+        stop_writer()
 
 
 def test_api_delete_runs_empty_ids_returns_422(client):
@@ -257,50 +262,58 @@ def test_api_invocations_list_get_enriched_and_slurm_404(client):
 def test_api_solver_summaries(tmp_path):
     db = tmp_path / "sum.db"
     init_db(db)
-    store_run(
-        db,
-        RunResult(
-            job_name="j",
-            solver_name="s-mon",
-            system_name="sy",
-            returncode=0,
-            stdout="",
-            stderr="",
-            runtime_seconds=1.0,
-            timestamp="2026-01-01T00:00:00+00:00",
-            passed=True,
-            job_batch_uuid="b",
-        ),
-    )
-    with patch("basic_restapi.fastapi_app.DB_PATH", db):
-        tc = TestClient(app)
-        r = tc.get("/api/solver_summaries")
-        assert r.status_code == 200
-        data = r.json()
-        assert isinstance(data, list)
-        assert any(x.get("solver_name") == "s-mon" for x in data)
+    start_writer(db)
+    try:
+        store_run(
+            db,
+            RunResult(
+                job_name="j",
+                solver_name="s-mon",
+                system_name="sy",
+                returncode=0,
+                stdout="",
+                stderr="",
+                runtime_seconds=1.0,
+                timestamp="2026-01-01T00:00:00+00:00",
+                passed=True,
+                job_batch_uuid="b",
+            ),
+        )
+        with patch("basic_restapi.fastapi_app.DB_PATH", db):
+            tc = TestClient(app)
+            r = tc.get("/api/solver_summaries")
+            assert r.status_code == 200
+            data = r.json()
+            assert isinstance(data, list)
+            assert any(x.get("solver_name") == "s-mon" for x in data)
+    finally:
+        stop_writer()
 
 
 def test_api_matrix_presets_crud(tmp_path):
     """GET/PUT/GET/DELETE /api/matrix_presets persist in DB."""
     db = tmp_path / "matrix_presets.db"
     init_db(db)
-    with patch("basic_restapi.fastapi_app.DB_PATH", db):
-        tc = TestClient(app)
-        assert tc.get("/api/matrix_presets").json() == []
-        put = tc.put(
-            "/api/matrix_presets/My-Smoke",
-            json={"cells": [{"name": "sol-a", "system": "sys-1"}]},
-        )
-        assert put.status_code == 200
-        data = put.json()
-        assert data["label"] == "my-smoke"
-        assert data["cells"] == [{"name": "sol-a", "system": "sys-1"}]
-        listed = tc.get("/api/matrix_presets").json()
-        assert len(listed) == 1
-        assert listed[0]["label"] == "my-smoke"
-        one = tc.get("/api/matrix_presets/My-Smoke").json()
-        assert one["cells"] == [{"name": "sol-a", "system": "sys-1"}]
-        assert tc.delete("/api/matrix_presets/my-smoke").status_code == 200
-        assert tc.get("/api/matrix_presets/my-smoke").status_code == 404
-        assert tc.delete("/api/matrix_presets/nonesuch").status_code == 404
+    start_writer(db)
+    try:
+        with patch("basic_restapi.fastapi_app.DB_PATH", db):
+            tc = TestClient(app)
+            assert tc.get("/api/matrix_presets").json() == []
+            put = tc.put(
+                "/api/matrix_presets/My-Smoke",
+                json={"cells": [{"name": "sol-a", "system": "sys-1"}]},
+            )
+            assert put.status_code == 200
+            data = put.json()
+            assert data["label"] == "my-smoke"
+            assert data["cells"] == [{"name": "sol-a", "system": "sys-1"}]
+            listed = tc.get("/api/matrix_presets").json()
+            assert len(listed) == 1
+            assert listed[0]["label"] == "my-smoke"
+            one = tc.get("/api/matrix_presets/My-Smoke").json()
+            assert one["cells"] == [{"name": "sol-a", "system": "sys-1"}]
+            assert tc.delete("/api/matrix_presets/my-smoke").status_code == 200
+            assert tc.get("/api/matrix_presets/my-smoke").status_code == 404
+            assert tc.delete("/api/matrix_presets/nonesuch").status_code == 404
+    finally:
+        stop_writer()

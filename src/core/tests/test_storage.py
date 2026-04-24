@@ -6,6 +6,8 @@ import pytest
 from harness import RunResult
 from harness.storage import (
     init_db,
+    start_writer,
+    stop_writer,
     store_run,
     get_runs,
     get_run_by_id,
@@ -18,6 +20,16 @@ from harness.storage import (
     get_job_batch_uuids,
     get_baseline_comparison,
 )
+
+
+@pytest.fixture(autouse=True)
+def _db_writer(tmp_path):
+    """Start the DB writer thread before each test, stop it after."""
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    start_writer(db_path)
+    yield
+    stop_writer()
 
 
 def _make_result(

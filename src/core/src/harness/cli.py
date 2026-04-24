@@ -9,7 +9,7 @@ from pathlib import Path
 from .add_solver import add_solver
 from .config import ConfigError, load_all, load_resources, load_systems, build_jobs_from_solver_specs
 from .runner import RunResult, run_jobs
-from .storage import init_db, store_run, get_runs
+from .storage import init_db, start_writer, stop_writer, store_run, get_runs
 
 
 def _print_and_build_output(results: list[RunResult], verbose: bool) -> list[dict]:
@@ -159,8 +159,12 @@ def main(argv: list[str] | None = None) -> int:
         results = run_jobs(job_list, solvers, systems, resources=resources)
         if not args.no_store:
             init_db(args.db)
-            for r in results:
-                store_run(args.db, r)
+            start_writer(args.db)
+            try:
+                for r in results:
+                    store_run(args.db, r)
+            finally:
+                stop_writer()
         output = _print_and_build_output(results, args.verbose)
         print(json.dumps(output, indent=2))
         return 0 if all(r.passed for r in results) else 1
@@ -250,8 +254,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.no_store:
         init_db(args.db)
-        for r in results:
-            store_run(args.db, r)
+        start_writer(args.db)
+        try:
+            for r in results:
+                store_run(args.db, r)
+        finally:
+            stop_writer()
 
     output = _print_and_build_output(results, args.verbose)
     print(json.dumps(output, indent=2))

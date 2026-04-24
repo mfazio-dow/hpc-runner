@@ -1,11 +1,25 @@
 """Run Matrix preset storage (SQLite)."""
 
+import pytest
+
 from harness.storage.db import (
+    init_db,
+    start_writer,
+    stop_writer,
     delete_matrix_preset,
     get_matrix_preset,
     list_matrix_presets,
     upsert_matrix_preset,
 )
+
+
+@pytest.fixture(autouse=True)
+def _db_writer(tmp_path):
+    db_path = tmp_path / "p.db"
+    init_db(db_path)
+    start_writer(db_path)
+    yield
+    stop_writer()
 
 
 def test_matrix_presets_upsert_list_get_delete(tmp_path):

@@ -6,6 +6,7 @@ import os
 import subprocess
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,7 +14,6 @@ import structlog
 
 from harness import (
     InvocationControl,
-    init_db,
     run_jobs,
     store_run,
 )
@@ -25,6 +25,26 @@ logger = structlog.get_logger()
 
 REGISTRY: dict[str, "InvocationRecord"] = {}
 LOCK = threading.Lock()
+
+_executor: ThreadPoolExecutor | None = None
+_executor_lock = threading.Lock()
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    global _executor
+    with _executor_lock:
+        if _executor is None:
+            _executor = ThreadPoolExecutor(max_workers=32, thread_name_prefix="inv-worker")
+        return _executor
+
+
+def shutdown_executor() -> None:
+    global _executor
+    with _executor_lock:
+        ex = _executor
+        _executor = None
+    if ex is not None:
+        ex.shutdown(wait=True, cancel_futures=False)
 
 
 def _local_snapshot(ctl: InvocationControl) -> dict[str, Any] | None:
@@ -207,7 +227,6 @@ def start_background_run(
                 batch_name=batch_name,
                 invoke_ctl=ctl,
             )
-            init_db(db_path)
             for res in results:
                 store_run(db_path, res)
             r0.results = _results_to_json(results)
@@ -224,7 +243,7 @@ def start_background_run(
         finally:
             r0.control.clear_live_stdout()
 
-    threading.Thread(target=worker, daemon=True).start()
+    _get_executor().submit(worker)
     return inv_id
 
 

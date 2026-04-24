@@ -6,6 +6,8 @@ from .runner import run_job, run_jobs, RunResult, InvocationControl
 from .parser import extract_metrics
 from .storage import (
     init_db,
+    start_writer,
+    stop_writer,
     store_run,
     get_runs,
     get_run_by_id,
@@ -40,6 +42,8 @@ __all__ = [
     "InvocationControl",
     "extract_metrics",
     "init_db",
+    "start_writer",
+    "stop_writer",
     "store_run",
     "get_runs",
     "get_run_by_id",

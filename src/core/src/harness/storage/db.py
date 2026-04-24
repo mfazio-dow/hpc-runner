@@ -2,19 +2,178 @@
 from __future__ import annotations
 
 import json
+import queue
 import sqlite3
+import threading
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from ..runner import RunResult
 
+logger = structlog.get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Read-only connection helper
+# ---------------------------------------------------------------------------
+
+def _connect_readonly(path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path), timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# DBWriter — single dedicated writer thread backed by a queue
+# ---------------------------------------------------------------------------
+
+class DBWriter:
+    def __init__(self, db_path: str | Path) -> None:
+        self._db_path = str(db_path)
+        self._queue: queue.Queue[tuple[str, tuple, Future] | None] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="db-writer")
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._thread.start()
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._queue.put(None)
+        self._thread.join(timeout=30)
+        self._started = False
+
+    def enqueue(self, sql: str, params: tuple = ()) -> Future:
+        fut: Future = Future()
+        self._queue.put((sql, params, fut))
+        return fut
+
+    def _run(self) -> None:
+        conn = sqlite3.connect(self._db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    break
+                batch: list[tuple[str, tuple, Future]] = [item]
+                while True:
+                    try:
+                        nxt = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if nxt is None:
+                        batch.append(nxt)  # type: ignore[arg-type]
+                        break
+                    batch.append(nxt)
+
+                stop = False
+                try:
+                    conn.execute("BEGIN")
+                    for entry in batch:
+                        if entry is None:
+                            stop = True
+                            continue
+                        sql, params, fut = entry
+                        try:
+                            cur = conn.execute(sql, params)
+                            fut.set_result((cur.lastrowid or 0, cur.rowcount))
+                        except Exception as exc:
+                            logger.error("db_writer.exec_error", sql=sql[:120], error=str(exc))
+                            fut.set_exception(exc)
+                    conn.commit()
+                except Exception as exc:
+                    logger.error("db_writer.batch_error", error=str(exc))
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    for entry in batch:
+                        if entry is None:
+                            stop = True
+                            continue
+                        _, _, fut = entry
+                        if not fut.done():
+                            fut.set_exception(exc)
+
+                if stop:
+                    break
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+_writer: DBWriter | None = None
+_writer_lock = threading.Lock()
+
+
+def start_writer(db_path: str | Path) -> None:
+    global _writer
+    with _writer_lock:
+        if _writer is not None:
+            return
+        _writer = DBWriter(db_path)
+        _writer.start()
+
+
+def stop_writer() -> None:
+    global _writer
+    with _writer_lock:
+        w = _writer
+        _writer = None
+    if w is not None:
+        w.stop()
+
+
+def _enqueue_write(sql: str, params: tuple = ()) -> Future:
+    w = _writer
+    if w is None:
+        raise RuntimeError("DBWriter not started — call start_writer() first")
+    return w.enqueue(sql, params)
+
+
+# ---------------------------------------------------------------------------
+# Multi-statement write helper (for operations needing >1 SQL in one tx)
+# ---------------------------------------------------------------------------
+
+def _enqueue_multi_write(statements: list[tuple[str, tuple]]) -> Future:
+    """Submit multiple SQL statements that must execute in the same transaction.
+
+    Enqueues them individually; they'll land in the same batch/transaction since
+    nothing else can interleave between successive put() calls on the same thread.
+    The last Future is returned (represents the final statement's lastrowid).
+    """
+    w = _writer
+    if w is None:
+        raise RuntimeError("DBWriter not started — call start_writer() first")
+    fut: Future = Future()
+    for sql, params in statements[:-1]:
+        w.enqueue(sql, params)
+    last_sql, last_params = statements[-1]
+    fut = w.enqueue(last_sql, last_params)
+    return fut
+
+
+# ---------------------------------------------------------------------------
+# Schema / init
+# ---------------------------------------------------------------------------
 
 def init_db(path: str | Path) -> None:
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist. Enable WAL mode."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    with sqlite3.connect(path, timeout=30) as conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS runs (
@@ -46,7 +205,7 @@ def init_db(path: str | Path) -> None:
             );
         """
         )
-        # Migration: add processor / validation_errors / is_baseline columns if missing (existing DBs)
+        # Migration: add columns if missing (existing DBs)
         cur = conn.execute("PRAGMA table_info(runs)")
         columns = [row[1] for row in cur.fetchall()]
         if "processor" not in columns:
@@ -68,73 +227,138 @@ def init_db(path: str | Path) -> None:
         if "submit_container" not in columns:
             conn.execute("ALTER TABLE runs ADD COLUMN submit_container TEXT")
         conn.commit()
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
 
+
+# ---------------------------------------------------------------------------
+# Write functions — routed through the writer queue
+# ---------------------------------------------------------------------------
 
 def store_run(db_path: str | Path, result: RunResult) -> int:
     """Store a run result and return the inserted row id."""
-    init_db(db_path)
     metrics_json = json.dumps(result.metrics) if result.metrics else None
     validation_errors_json = json.dumps(result.validation_errors or [])
     is_baseline = 1 if getattr(result, "baseline", False) else 0
-    with sqlite3.connect(db_path) as conn:
-        # If this run is a baseline (e.g. job.baseline: true), it replaces any existing
-        # baseline for the same solver so we always have one active baseline per solver.
-        if is_baseline:
-            conn.execute(
+
+    insert_sql = """
+        INSERT INTO runs (
+            job_name, solver_name, system_name, returncode, passed,
+            runtime_seconds, timestamp, stdout, stderr, metrics_json,
+            processor, validation_errors, is_baseline, job_batch_uuid,
+            job_batch_date, job_batch_name, scheduler_backend,
+            scheduler_job_ids, submit_container
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    insert_params = (
+        result.job_name,
+        result.solver_name,
+        result.system_name,
+        result.returncode,
+        1 if result.passed else 0,
+        result.runtime_seconds,
+        result.timestamp,
+        result.stdout,
+        result.stderr,
+        metrics_json,
+        result.processor,
+        validation_errors_json,
+        is_baseline,
+        result.job_batch_uuid,
+        result.job_batch_date,
+        result.job_batch_name,
+        getattr(result, "scheduler_backend", None) or "",
+        json.dumps(getattr(result, "scheduler_job_ids", None) or []),
+        getattr(result, "submit_container", None) or "",
+    )
+
+    if is_baseline:
+        stmts: list[tuple[str, tuple]] = [
+            (
                 "UPDATE runs SET is_baseline = 0 WHERE solver_name = ?",
                 (result.solver_name,),
-            )
-        cur = conn.execute(
-            """
-            INSERT INTO runs (
-                job_name,
-                solver_name,
-                system_name,
-                returncode,
-                passed,
-                runtime_seconds,
-                timestamp,
-                stdout,
-                stderr,
-                metrics_json,
-                processor,
-                validation_errors,
-                is_baseline,
-                job_batch_uuid,
-                job_batch_date,
-                job_batch_name,
-                scheduler_backend,
-                scheduler_job_ids,
-                submit_container
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                result.job_name,
-                result.solver_name,
-                result.system_name,
-                result.returncode,
-                1 if result.passed else 0,
-                result.runtime_seconds,
-                result.timestamp,
-                result.stdout,
-                result.stderr,
-                metrics_json,
-                result.processor,
-                validation_errors_json,
-                is_baseline,
-                result.job_batch_uuid,
-                result.job_batch_date,
-                result.job_batch_name,
-                getattr(result, "scheduler_backend", None) or "",
-                json.dumps(getattr(result, "scheduler_job_ids", None) or []),
-                getattr(result, "submit_container", None) or "",
             ),
-        )
-        row_id = cur.lastrowid or 0
-        conn.commit()
-    return row_id
+            (insert_sql, insert_params),
+        ]
+        fut = _enqueue_multi_write(stmts)
+    else:
+        fut = _enqueue_write(insert_sql, insert_params)
 
+    lastrowid, _ = fut.result()
+    return lastrowid
+
+
+def delete_runs(db_path: str | Path, run_ids: list[int]) -> int:
+    """Delete runs by primary key. Returns the number of rows deleted."""
+    if not run_ids:
+        return 0
+    unique_ids = list(dict.fromkeys(int(i) for i in run_ids))
+    placeholders = ",".join("?" * len(unique_ids))
+    fut = _enqueue_write(
+        f"DELETE FROM runs WHERE id IN ({placeholders})",
+        tuple(unique_ids),
+    )
+    _, rowcount = fut.result()
+    return rowcount
+
+
+def set_baseline_run(db_path: str | Path, run_id: int) -> dict[str, Any] | None:
+    """Set a specific run as the baseline for its solver."""
+    with _connect_readonly(db_path) as conn:
+        row = conn.execute("SELECT id, solver_name FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        return None
+    solver_name = row[1]
+
+    stmts: list[tuple[str, tuple]] = [
+        ("UPDATE runs SET is_baseline = 0 WHERE solver_name = ?", (solver_name,)),
+        ("UPDATE runs SET is_baseline = 1 WHERE id = ?", (run_id,)),
+    ]
+    _enqueue_multi_write(stmts).result()  # wait for completion
+
+    with _connect_readonly(db_path) as conn:
+        updated = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return _run_to_response(dict(updated))
+
+
+def upsert_matrix_preset(
+    db_path: str | Path, label: str, cells: list[dict[str, Any]]
+) -> None:
+    """Insert or replace a Run Matrix preset."""
+    key = _normalize_matrix_preset_label(label)
+    if not key:
+        raise ValueError("preset label must be non-empty")
+    now = datetime.now(timezone.utc).isoformat()
+    payload = json.dumps(cells, ensure_ascii=False)
+    fut = _enqueue_write(
+        """
+        INSERT INTO run_matrix_presets (label, cells_json, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(label) DO UPDATE SET
+            cells_json = excluded.cells_json,
+            updated_at = excluded.updated_at
+        """,
+        (key, payload, now),
+    )
+    fut.result()  # wait for completion
+
+
+def delete_matrix_preset(db_path: str | Path, label: str) -> int:
+    """Delete preset by normalized label. Returns rowcount (0 if missing)."""
+    key = _normalize_matrix_preset_label(label)
+    if not key:
+        return 0
+    fut = _enqueue_write(
+        "DELETE FROM run_matrix_presets WHERE label = ?",
+        (key,),
+    )
+    _, rowcount = fut.result()
+    return rowcount
+
+
+# ---------------------------------------------------------------------------
+# Read functions — direct connections (WAL allows concurrent readers)
+# ---------------------------------------------------------------------------
 
 def get_runs(
     db_path: str | Path,
@@ -145,7 +369,6 @@ def get_runs(
     offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Fetch runs with optional solver, processor, and system (system_name) filters."""
-    init_db(db_path)
     conditions: list[str] = []
     params: list[Any] = []
     if solver:
@@ -159,8 +382,7 @@ def get_runs(
         params.append(system)
     where = ("WHERE " + " AND ".join(conditions) + " ") if conditions else ""
     params.extend([limit, offset])
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    with _connect_readonly(db_path) as conn:
         rows = conn.execute(
             f"""SELECT * FROM runs {where}ORDER BY timestamp DESC LIMIT ? OFFSET ?""",
             params,
@@ -170,34 +392,14 @@ def get_runs(
 
 def get_run_by_id(db_path: str | Path, run_id: int) -> dict[str, Any] | None:
     """Fetch a single run by id."""
-    init_db(db_path)
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    with _connect_readonly(db_path) as conn:
         row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return dict(row) if row else None
 
 
-def delete_runs(db_path: str | Path, run_ids: list[int]) -> int:
-    """
-    Delete runs by primary key. Baseline rows are allowed; the solver may have no baseline afterward.
-    Returns the number of rows deleted.
-    """
-    if not run_ids:
-        return 0
-    init_db(db_path)
-    unique_ids = list(dict.fromkeys(int(i) for i in run_ids))
-    placeholders = ",".join("?" * len(unique_ids))
-    with sqlite3.connect(db_path) as conn:
-        cur = conn.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", unique_ids)
-        conn.commit()
-        return cur.rowcount
-
-
 def get_solver_run_summaries(db_path: str | Path) -> list[dict[str, Any]]:
     """Per-solver aggregates for monitoring: run count, passes, last run time, last job name."""
-    init_db(db_path)
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    with _connect_readonly(db_path) as conn:
         rows = conn.execute(
             """
             SELECT
@@ -226,9 +428,8 @@ def get_solver_run_summaries(db_path: str | Path) -> list[dict[str, Any]]:
 
 
 def get_all_metrics_series(db_path: str | Path, limit: int = 500) -> list[tuple[str, str]]:
-    """Discover all (solver_name, metric_name) pairs that have data. For dashboard."""
-    init_db(db_path)
-    with sqlite3.connect(db_path) as conn:
+    """Discover all (solver_name, metric_name) pairs that have data."""
+    with _connect_readonly(db_path) as conn:
         rows = conn.execute(
             """SELECT solver_name, metrics_json FROM runs
                WHERE metrics_json IS NOT NULL AND metrics_json != '{}'
@@ -259,9 +460,8 @@ def get_metrics_history(
     metric_name: str,
     limit: int = 100,
 ) -> list[tuple[str, float]]:
-    """Get (timestamp, value) history for a metric. For trend visualization."""
-    init_db(db_path)
-    with sqlite3.connect(db_path) as conn:
+    """Get (timestamp, value) history for a metric."""
+    with _connect_readonly(db_path) as conn:
         rows = conn.execute(
             """SELECT timestamp, metrics_json FROM runs
                WHERE solver_name = ? AND metrics_json IS NOT NULL
@@ -305,10 +505,8 @@ def _run_to_response(r: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_baseline_run(db_path: str | Path, solver_name: str) -> dict[str, Any] | None:
-    """Return the run marked as baseline for the given solver (one per solver), or None."""
-    init_db(db_path)
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    """Return the run marked as baseline for the given solver, or None."""
+    with _connect_readonly(db_path) as conn:
         row = conn.execute(
             """SELECT * FROM runs
                WHERE solver_name = ? AND is_baseline = 1
@@ -320,39 +518,13 @@ def get_baseline_run(db_path: str | Path, solver_name: str) -> dict[str, Any] | 
     return _run_to_response(dict(row))
 
 
-def set_baseline_run(db_path: str | Path, run_id: int) -> dict[str, Any] | None:
-    """
-    Set a specific run as the baseline for its solver.
-    Clears is_baseline on all other runs of the same solver, then sets this run to baseline.
-    Returns the updated run dict, or None if run_id not found.
-    """
-    init_db(db_path)
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT id, solver_name FROM runs WHERE id = ?", (run_id,)).fetchone()
-        if row is None:
-            return None
-        solver_name = row[1]
-        conn.execute("UPDATE runs SET is_baseline = 0 WHERE solver_name = ?", (solver_name,))
-        conn.execute("UPDATE runs SET is_baseline = 1 WHERE id = ?", (run_id,))
-        conn.commit()
-        updated = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-    return _run_to_response(dict(updated))
-
-
 def get_baseline_comparison(
     db_path: str | Path,
     solver_name: str | None = None,
     limit_per_solver: int = 50,
 ) -> list[dict[str, Any]]:
-    """
-    For each solver (or the given solver), return baseline run and other runs with
-    per-metric comparison. Each item: solver_name, baseline_run, other_runs,
-    comparisons: list of {run_id, job_name, timestamp, metrics, vs_baseline: {metric: {baseline, value, delta, delta_pct}}}.
-    """
-    init_db(db_path)
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    """Per-solver baseline comparison with per-metric deltas."""
+    with _connect_readonly(db_path) as conn:
         if solver_name:
             solvers_rows = conn.execute(
                 "SELECT DISTINCT solver_name FROM runs WHERE solver_name = ?",
@@ -373,8 +545,7 @@ def get_baseline_comparison(
             })
             continue
         baseline_metrics = baseline.get("metrics") or {}
-        with sqlite3.connect(db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with _connect_readonly(db_path) as conn:
             others = conn.execute(
                 """SELECT * FROM runs
                    WHERE solver_name = ? AND (is_baseline = 0 OR id != ?)
@@ -413,12 +584,11 @@ def get_baseline_comparison(
         })
     return result
 
+
 def get_job_batch_uuids(db_path: str | Path, limit: int = 100) -> list[Any] | None:
-    """Return job_batch_uuid values ordered by most recent run in each batch (MAX(timestamp))."""
-    init_db(db_path)
+    """Return job_batch_uuid values ordered by most recent run in each batch."""
     lim = int(limit)
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    with _connect_readonly(db_path) as conn:
         rows = conn.execute(
             """
             SELECT job_batch_uuid
@@ -440,10 +610,8 @@ def _normalize_matrix_preset_label(label: str) -> str:
 
 
 def list_matrix_presets(db_path: str | Path) -> list[dict[str, Any]]:
-    """Return saved Run Matrix selections: each dict has label, cells (list of dicts), updated_at."""
-    init_db(db_path)
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    """Return saved Run Matrix selections."""
+    with _connect_readonly(db_path) as conn:
         rows = conn.execute(
             "SELECT label, cells_json, updated_at FROM run_matrix_presets ORDER BY label ASC"
         ).fetchall()
@@ -459,13 +627,11 @@ def list_matrix_presets(db_path: str | Path) -> list[dict[str, Any]]:
 
 
 def get_matrix_preset(db_path: str | Path, label: str) -> dict[str, Any] | None:
-    """Fetch one preset by label (normalized). Returns dict with label, cells, updated_at or None."""
+    """Fetch one preset by label (normalized)."""
     key = _normalize_matrix_preset_label(label)
     if not key:
         return None
-    init_db(db_path)
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    with _connect_readonly(db_path) as conn:
         row = conn.execute(
             "SELECT label, cells_json, updated_at FROM run_matrix_presets WHERE label = ?",
             (key,),
@@ -478,39 +644,3 @@ def get_matrix_preset(db_path: str | Path, label: str) -> dict[str, Any] | None:
     except (json.JSONDecodeError, TypeError):
         r["cells"] = []
     return r
-
-
-def upsert_matrix_preset(
-    db_path: str | Path, label: str, cells: list[dict[str, Any]]
-) -> None:
-    """Insert or replace a Run Matrix preset. Label is normalized; cells stored as JSON array."""
-    key = _normalize_matrix_preset_label(label)
-    if not key:
-        raise ValueError("preset label must be non-empty")
-    init_db(db_path)
-    now = datetime.now(timezone.utc).isoformat()
-    payload = json.dumps(cells, ensure_ascii=False)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO run_matrix_presets (label, cells_json, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(label) DO UPDATE SET
-                cells_json = excluded.cells_json,
-                updated_at = excluded.updated_at
-            """,
-            (key, payload, now),
-        )
-        conn.commit()
-
-
-def delete_matrix_preset(db_path: str | Path, label: str) -> int:
-    """Delete preset by normalized label. Returns rowcount (0 if missing)."""
-    key = _normalize_matrix_preset_label(label)
-    if not key:
-        return 0
-    init_db(db_path)
-    with sqlite3.connect(db_path) as conn:
-        cur = conn.execute("DELETE FROM run_matrix_presets WHERE label = ?", (key,))
-        conn.commit()
-        return cur.rowcount

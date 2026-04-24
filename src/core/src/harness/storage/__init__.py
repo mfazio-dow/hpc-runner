@@ -1,6 +1,8 @@
 # storage/__init__.py
 from .db import (
     init_db,
+    start_writer,
+    stop_writer,
     store_run,
     get_runs,
     get_run_by_id,
@@ -20,6 +22,8 @@ from .db import (
 
 __all__ = [
     "init_db",
+    "start_writer",
+    "stop_writer",
     "store_run",
     "get_runs",
     "get_run_by_id",

@@ -2,6 +2,8 @@
 
 import json
 import os
+from contextlib import asynccontextmanager
+
 import structlog
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +17,8 @@ from harness import (
     run_jobs,
     init_db,
     store_run,
+    start_writer,
+    stop_writer,
     get_runs,
     get_run_by_id,
     delete_runs,
@@ -36,8 +40,24 @@ from harness import (
 from . import invocations
 from .slurm_tools import query_slurm_job_state
 
-app = FastAPI(title="HPC Regression API", version="0.1.0")
 logger = structlog.get_logger()
+
+CONFIG_DIR = get_config_dir()
+DB_PATH = get_db_path()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db(str(DB_PATH))
+    start_writer(str(DB_PATH))
+    logger.info("startup", db_path=str(DB_PATH), writer="started")
+    yield
+    stop_writer()
+    invocations.shutdown_executor()
+    logger.info("shutdown", writer="stopped", executor="stopped")
+
+
+app = FastAPI(title="HPC Regression API", version="0.1.0", lifespan=lifespan)
 
 # Allow the Streamlit UI (different port) to poll invocation JSON from the browser (live log iframe).
 _cors_origins = [
@@ -61,10 +81,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-CONFIG_DIR = get_config_dir()
-DB_PATH = get_db_path()
-
 
 def _normalize_run_row(r: dict) -> None:
     """Decode JSON-ish columns for API responses (mutates dict in place)."""
@@ -247,7 +263,7 @@ def api_run_solvers(body: RunSolversRequest | None = None):
         return JSONResponse(status_code=202, content=content)
 
     results = run_jobs(job_list, solvers, systems, resources=resources, batch_name=effective_label)
-    init_db(DB_PATH)
+
     for r in results:
         store_run(DB_PATH, r)
 
@@ -285,7 +301,7 @@ def api_runs(
 ):
     """List recent runs, optionally filtered by solver, processor, or system (system_name)."""
     limit = min(limit, 500)
-    init_db(DB_PATH)
+
     runs = get_runs(
         DB_PATH,
         solver=solver,
@@ -304,7 +320,7 @@ def api_delete_runs(body: DeleteRunsRequest):
     """Delete stored runs by id. May remove a baseline row (solver then has no baseline)."""
     if not body.ids:
         raise HTTPException(status_code=422, detail="ids must be non-empty")
-    init_db(DB_PATH)
+
     n = delete_runs(DB_PATH, body.ids)
     if n == 0:
         raise HTTPException(status_code=404, detail="No matching run ids")
@@ -314,14 +330,14 @@ def api_delete_runs(body: DeleteRunsRequest):
 @app.get("/api/matrix_presets")
 def api_list_matrix_presets():
     """List saved Run Matrix selections (label, cells, updated_at)."""
-    init_db(DB_PATH)
+
     return list_matrix_presets(DB_PATH)
 
 
 @app.get("/api/matrix_presets/{label}")
 def api_get_matrix_preset(label: str):
     """Get one Run Matrix preset by session label (normalized case-insensitively)."""
-    init_db(DB_PATH)
+
     row = get_matrix_preset(DB_PATH, label)
     if not row:
         raise HTTPException(status_code=404, detail="Preset not found")
@@ -331,7 +347,7 @@ def api_get_matrix_preset(label: str):
 @app.put("/api/matrix_presets/{label}")
 def api_put_matrix_preset(label: str, body: MatrixPresetPut):
     """Create or replace a Run Matrix preset."""
-    init_db(DB_PATH)
+
     cells = [c.model_dump() for c in body.cells]
     try:
         upsert_matrix_preset(DB_PATH, label, cells)
@@ -346,7 +362,7 @@ def api_put_matrix_preset(label: str, body: MatrixPresetPut):
 @app.delete("/api/matrix_presets/{label}")
 def api_delete_matrix_preset(label: str):
     """Delete a saved Run Matrix preset."""
-    init_db(DB_PATH)
+
     n = delete_matrix_preset(DB_PATH, label)
     if n == 0:
         raise HTTPException(status_code=404, detail="Preset not found")
@@ -356,7 +372,7 @@ def api_delete_matrix_preset(label: str):
 @app.get("/api/runs/{run_id}")
 def api_run_detail(run_id: int):
     """Get a single run by id."""
-    init_db(DB_PATH)
+
     run = get_run_by_id(DB_PATH, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -368,7 +384,7 @@ def api_run_detail(run_id: int):
 @app.get("/api/runs/{run_id}/slurm_status")
 def api_run_slurm_status(run_id: int):
     """Live squeue/sacct for SLURM job ids on this run (requires RUN_SLURM_E2E + docker/host tools)."""
-    init_db(DB_PATH)
+
     run = get_run_by_id(DB_PATH, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -429,7 +445,7 @@ def api_cancel_invocation(invocation_id: str):
 @app.get("/api/solver_summaries")
 def api_solver_summaries():
     """Per-solver aggregate stats from stored runs (monitoring)."""
-    init_db(DB_PATH)
+
     return get_solver_run_summaries(DB_PATH)
 
 
@@ -440,14 +456,14 @@ def api_baseline_comparison(solver: str | None = None, limit: int = 50):
     Returns for each solver: baseline_run, other runs, and per-metric deltas (vs_baseline).
     """
     limit = min(limit, 200)
-    init_db(DB_PATH)
+
     return get_baseline_comparison(DB_PATH, solver_name=solver, limit_per_solver=limit)
 
 
 @app.get("/api/solvers/{solver_name}/baseline")
 def api_solver_baseline(solver_name: str):
     """Return the current baseline run for the given solver, or 404."""
-    init_db(DB_PATH)
+
     run = get_baseline_run(DB_PATH, solver_name)
     if not run:
         raise HTTPException(status_code=404, detail=f"No baseline run for solver '{solver_name}'")
@@ -460,7 +476,7 @@ def api_set_baseline(run_id: int):
     Set a specific run as the baseline for its solver.
     Other runs of the same solver are no longer baseline. Returns the updated run.
     """
-    init_db(DB_PATH)
+
     run = set_baseline_run(DB_PATH, run_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
@@ -475,7 +491,7 @@ def api_metrics_history(
 ):
     """Get metric history for trend visualization."""
     limit = min(limit, 500)
-    init_db(DB_PATH)
+
     history: list[tuple[str, str]] = get_metrics_history(DB_PATH, solver_name, metric_name, limit=limit)
     return [{"timestamp": ts, "value": v} for ts, v in history]
 
@@ -485,7 +501,7 @@ def api_available_metrics(
 ):
     """Get a list of all metrics/solver combos. by default limits the output to 100"""
     limit = min(limit, 500)
-    init_db(DB_PATH)
+
     available_metrics: list[tuple[str, str]] = get_all_metrics_series(DB_PATH)
     return [{"solver": s, "metric": m} for s, m in available_metrics]
 
@@ -494,7 +510,7 @@ def api_job_batch_uuids(limit: int = 100):
     """
     Gets a list of
     """
-    init_db(DB_PATH)
+
     return get_job_batch_uuids(DB_PATH, limit=limit)
 
 def main():
