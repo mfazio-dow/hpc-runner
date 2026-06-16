@@ -476,7 +476,7 @@ def api_metrics_history(
     """Get metric history for trend visualization."""
     limit = min(limit, 500)
     init_db(DB_PATH)
-    history: list[tuple[str, str]] = get_metrics_history(DB_PATH, solver_name, metric_name, limit=limit)
+    history: list[tuple[str, float]] = get_metrics_history(DB_PATH, solver_name, metric_name, limit=limit)
     return [{"timestamp": ts, "value": v} for ts, v in history]
 
 @app.get("/api/available_metrics")
