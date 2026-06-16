@@ -107,7 +107,7 @@ Use **`GET /docs`** on the API host for the full OpenAPI surface. Typical automa
 
 | Endpoint | Role |
 |----------|------|
-| `GET /api/solvers`, `GET /api/systems` | Discover names for scripts and Run Matrix |
+| `GET /api/solvers`, `GET /api/systems`, `GET /api/resources` | Discover names for scripts and Run Matrix |
 | `POST /api/run_solvers` | Body: `solvers: [{ "name", "system"? }, ...]`, optional `session_label` / `batch_name`, `background`. Sync: **200** + results. **`background: true`**: **202** + **invocation** ids—see **[ARCHITECTURE.md](ARCHITECTURE.md) §5.2** |
 | `GET /api/invocations`, `GET /api/invocations/<id>`, `GET /api/invocations/<id>/execution_status` | Track and inspect background runs |
 | `POST /api/invocations/<id>/cancel` | Cancel run (subprocess + optional `scancel`) |
