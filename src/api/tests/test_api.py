@@ -304,3 +304,8 @@ def test_api_matrix_presets_crud(tmp_path):
         assert tc.delete("/api/matrix_presets/my-smoke").status_code == 200
         assert tc.get("/api/matrix_presets/my-smoke").status_code == 404
         assert tc.delete("/api/matrix_presets/nonesuch").status_code == 404
+
+
+def test_api_resources(client):
+    response = client.get("/api/resources")
+    assert response.status_code == 200

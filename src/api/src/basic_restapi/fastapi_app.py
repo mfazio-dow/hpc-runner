@@ -194,6 +194,21 @@ def api_systems():
         for s in systems.values()
     ]
 
+@app.get("/api/resources")
+def api_resources():
+    """List configured resources."""
+    resources, _, _ = _load_definitions()
+    return [
+        {
+            "name": r.name,
+            "cpus": r.cpus,
+            "gpus": r.gpus,
+            "memory_gb": r.memory_gb,
+            "env": r.env
+        }
+        for r in resources.values()
+    ]
+
 @app.post("/api/run_solvers")
 def api_run_solvers(body: RunSolversRequest | None = None):
     """Run one or more solvers (solver-first). Each background solver gets its own invocation (cancel per solver)."""
