@@ -6,7 +6,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from harness import RunResult, init_db, start_writer, stop_writer, store_run
+from harness import RunResult, init_db, db_writer_session, store_run
 
 from basic_restapi.fastapi_app import app
 
@@ -50,7 +50,9 @@ def test_api_config_error_returns_500(tmp_path):
     )
     (tmp_path / "solvers" / "sol1").mkdir()
     (tmp_path / "solvers" / "sol1" / "solver.yaml").write_text(
-        yaml.safe_dump({"name": "sol1", "entrypoint": "run.sh", "allowed_systems": ["bogus"]})
+        yaml.safe_dump(
+            {"name": "sol1", "entrypoint": "run.sh", "allowed_systems": ["bogus"]}
+        )
     )
     (tmp_path / "solvers" / "sol1" / "run.sh").write_text("#!/bin/bash\necho ok\n")
 
@@ -93,6 +95,7 @@ def test_api_baseline_comparison_returns_list(client):
         assert "other_runs" in entry
         assert "comparisons" in entry
 
+
 def test_api_job_batch_uuids_returns_list(client):
     """GET /api/get_job_batch_uuids returns 200 and a list."""
     response = client.get("/api/get_job_batch_uuids")
@@ -105,10 +108,8 @@ def test_api_delete_runs(tmp_path):
     """DELETE /api/runs removes rows from the configured DB."""
     db = tmp_path / "del.db"
     init_db(db)
-    start_writer(db)
-    try:
+    with db_writer_session(db):
         rid = store_run(
-            db,
             RunResult(
                 job_name="j",
                 solver_name="sv",
@@ -120,7 +121,7 @@ def test_api_delete_runs(tmp_path):
                 timestamp="2026-01-01T00:00:00+00:00",
                 passed=True,
                 job_batch_uuid="batch-u",
-            ),
+            )
         )
         with patch("basic_restapi.fastapi_app.DB_PATH", db):
             tc = TestClient(app)
@@ -128,8 +129,6 @@ def test_api_delete_runs(tmp_path):
             assert r.status_code == 200
             assert r.json()["deleted"] == 1
             assert tc.get(f"/api/runs/{rid}").status_code == 404
-    finally:
-        stop_writer()
 
 
 def test_api_delete_runs_empty_ids_returns_422(client):
@@ -141,11 +140,14 @@ def test_api_run_solvers_session_label_equivalent_to_batch_name(client):
     """POST with session_label only passes the same sub_batch string as batch_name-only."""
     captured: list[str] = []
 
-    def fake_start(jl, sol, sys, res, bn, db, *, solver_name: str = "", job_names=None):
+    def fake_start(jl, sol, sys, res, bn, *, solver_name: str = "", job_names=None):
         captured.append(bn)
         return f"id-{solver_name or 'none'}"
 
-    with patch("basic_restapi.fastapi_app.invocations.start_background_run", side_effect=fake_start):
+    with patch(
+        "basic_restapi.fastapi_app.invocations.start_background_run",
+        side_effect=fake_start,
+    ):
         r_sl = client.post(
             "/api/run_solvers",
             json={
@@ -172,11 +174,14 @@ def test_api_run_solvers_session_label_equivalent_to_batch_name(client):
 def test_api_run_solvers_session_label_wins_when_both_set(client):
     captured: list[str] = []
 
-    def fake_start(jl, sol, sys, res, bn, db, *, solver_name: str = "", job_names=None):
+    def fake_start(jl, sol, sys, res, bn, *, solver_name: str = "", job_names=None):
         captured.append(bn)
         return "id"
 
-    with patch("basic_restapi.fastapi_app.invocations.start_background_run", side_effect=fake_start):
+    with patch(
+        "basic_restapi.fastapi_app.invocations.start_background_run",
+        side_effect=fake_start,
+    ):
         r = client.post(
             "/api/run_solvers",
             json={
@@ -194,11 +199,14 @@ def test_api_run_solvers_background_one_invocation_per_solver(client):
     """background starts one invocation per solver."""
     calls: list[tuple[str, list[str]]] = []
 
-    def fake_start(jl, sol, sys, res, bn, db, *, solver_name: str = "", job_names=None):
+    def fake_start(jl, sol, sys, res, bn, *, solver_name: str = "", job_names=None):
         calls.append((solver_name or "", [j.name for j in jl]))
         return f"id-{solver_name or 'none'}"
 
-    with patch("basic_restapi.fastapi_app.invocations.start_background_run", side_effect=fake_start):
+    with patch(
+        "basic_restapi.fastapi_app.invocations.start_background_run",
+        side_effect=fake_start,
+    ):
         r = client.post(
             "/api/run_solvers",
             json={
@@ -223,7 +231,9 @@ def test_api_invocations_list_get_enriched_and_slurm_404(client):
 
     invocations.REGISTRY.clear()
     try:
-        rec = invocations.InvocationRecord(id="deadbeef", status="running", batch_name="batch-a")
+        rec = invocations.InvocationRecord(
+            id="deadbeef", status="running", batch_name="batch-a"
+        )
         rec.control.slurm_job_ids.append("999")
         rec.control.submit_container = "host"
         rec.control.jobs_total = 3
@@ -262,10 +272,8 @@ def test_api_invocations_list_get_enriched_and_slurm_404(client):
 def test_api_solver_summaries(tmp_path):
     db = tmp_path / "sum.db"
     init_db(db)
-    start_writer(db)
-    try:
+    with db_writer_session(db):
         store_run(
-            db,
             RunResult(
                 job_name="j",
                 solver_name="s-mon",
@@ -277,7 +285,7 @@ def test_api_solver_summaries(tmp_path):
                 timestamp="2026-01-01T00:00:00+00:00",
                 passed=True,
                 job_batch_uuid="b",
-            ),
+            )
         )
         with patch("basic_restapi.fastapi_app.DB_PATH", db):
             tc = TestClient(app)
@@ -286,16 +294,13 @@ def test_api_solver_summaries(tmp_path):
             data = r.json()
             assert isinstance(data, list)
             assert any(x.get("solver_name") == "s-mon" for x in data)
-    finally:
-        stop_writer()
 
 
 def test_api_matrix_presets_crud(tmp_path):
     """GET/PUT/GET/DELETE /api/matrix_presets persist in DB."""
     db = tmp_path / "matrix_presets.db"
     init_db(db)
-    start_writer(db)
-    try:
+    with db_writer_session(db):
         with patch("basic_restapi.fastapi_app.DB_PATH", db):
             tc = TestClient(app)
             assert tc.get("/api/matrix_presets").json() == []
@@ -315,5 +320,3 @@ def test_api_matrix_presets_crud(tmp_path):
             assert tc.delete("/api/matrix_presets/my-smoke").status_code == 200
             assert tc.get("/api/matrix_presets/my-smoke").status_code == 404
             assert tc.delete("/api/matrix_presets/nonesuch").status_code == 404
-    finally:
-        stop_writer()

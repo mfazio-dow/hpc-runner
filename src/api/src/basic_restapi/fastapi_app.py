@@ -69,10 +69,13 @@ _cors_origins = [
     if o.strip()
 ]
 # Iframe live-log fetch() from Streamlit on another host (e.g. LAN IP) needs a matching origin.
-_cors_origin_regex = os.environ.get(
-    "HPC_CORS_ORIGIN_REGEX",
-    r"^http://[\w\.\-]+:(8501|8502)$",
-).strip() or None
+_cors_origin_regex = (
+    os.environ.get(
+        "HPC_CORS_ORIGIN_REGEX",
+        r"^http://[\w\.\-]+:(8501|8502)$",
+    ).strip()
+    or None
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -81,6 +84,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 def _normalize_run_row(r: dict) -> None:
     """Decode JSON-ish columns for API responses (mutates dict in place)."""
@@ -195,6 +199,7 @@ def api_solvers():
         for s in solvers.values()
     ]
 
+
 @app.get("/api/systems")
 def api_systems():
     """List configured systems."""
@@ -209,6 +214,7 @@ def api_systems():
         }
         for s in systems.values()
     ]
+
 
 @app.post("/api/run_solvers")
 def api_run_solvers(body: RunSolversRequest | None = None):
@@ -236,14 +242,15 @@ def api_run_solvers(body: RunSolversRequest | None = None):
     if body.background:
         inv_rows: list[dict] = []
         for j in job_list:
-            sub_batch = f"{effective_label}:{j.solver}" if effective_label.strip() else j.solver
+            sub_batch = (
+                f"{effective_label}:{j.solver}" if effective_label.strip() else j.solver
+            )
             inv_id = invocations.start_background_run(
                 [j],
                 solvers,
                 systems,
                 resources,
                 sub_batch,
-                str(DB_PATH),
                 solver_name=j.solver,
                 job_names=[j.name],
             )
@@ -262,10 +269,12 @@ def api_run_solvers(body: RunSolversRequest | None = None):
             content["invocation_id"] = inv_rows[0]["invocation_id"]
         return JSONResponse(status_code=202, content=content)
 
-    results = run_jobs(job_list, solvers, systems, resources=resources, batch_name=effective_label)
+    results = run_jobs(
+        job_list, solvers, systems, resources=resources, batch_name=effective_label
+    )
 
     for r in results:
-        store_run(DB_PATH, r)
+        store_run(r)
 
     response: list[dict] = []
     for r in results:
@@ -321,7 +330,7 @@ def api_delete_runs(body: DeleteRunsRequest):
     if not body.ids:
         raise HTTPException(status_code=422, detail="ids must be non-empty")
 
-    n = delete_runs(DB_PATH, body.ids)
+    n = delete_runs(body.ids)
     if n == 0:
         raise HTTPException(status_code=404, detail="No matching run ids")
     return {"deleted": n}
@@ -350,7 +359,7 @@ def api_put_matrix_preset(label: str, body: MatrixPresetPut):
 
     cells = [c.model_dump() for c in body.cells]
     try:
-        upsert_matrix_preset(DB_PATH, label, cells)
+        upsert_matrix_preset(label, cells)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     row = get_matrix_preset(DB_PATH, label)
@@ -363,7 +372,7 @@ def api_put_matrix_preset(label: str, body: MatrixPresetPut):
 def api_delete_matrix_preset(label: str):
     """Delete a saved Run Matrix preset."""
 
-    n = delete_matrix_preset(DB_PATH, label)
+    n = delete_matrix_preset(label)
     if n == 0:
         raise HTTPException(status_code=404, detail="Preset not found")
     return {"deleted": n}
@@ -393,7 +402,12 @@ def api_run_slurm_status(run_id: int):
     except json.JSONDecodeError:
         jids = []
     if not jids:
-        return {"enabled": True, "job_ids": [], "output": "", "message": "No SLURM job ids recorded for this run"}
+        return {
+            "enabled": True,
+            "job_ids": [],
+            "output": "",
+            "message": "No SLURM job ids recorded for this run",
+        }
     cont = (run.get("submit_container") or "").strip() or None
     return query_slurm_job_state([str(j) for j in jids], cont)
 
@@ -438,7 +452,10 @@ def api_cancel_invocation(invocation_id: str):
     if not ok and code == "not_found":
         raise HTTPException(status_code=404, detail="Invocation not found")
     if not ok:
-        return JSONResponse(status_code=400, content={"ok": False, "detail": code, "scancel_notes": notes})
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "detail": code, "scancel_notes": notes},
+        )
     return {"ok": True, "scancel_notes": notes}
 
 
@@ -466,7 +483,9 @@ def api_solver_baseline(solver_name: str):
 
     run = get_baseline_run(DB_PATH, solver_name)
     if not run:
-        raise HTTPException(status_code=404, detail=f"No baseline run for solver '{solver_name}'")
+        raise HTTPException(
+            status_code=404, detail=f"No baseline run for solver '{solver_name}'"
+        )
     return run
 
 
@@ -477,7 +496,7 @@ def api_set_baseline(run_id: int):
     Other runs of the same solver are no longer baseline. Returns the updated run.
     """
 
-    run = set_baseline_run(DB_PATH, run_id)
+    run = set_baseline_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     return run
@@ -492,8 +511,11 @@ def api_metrics_history(
     """Get metric history for trend visualization."""
     limit = min(limit, 500)
 
-    history: list[tuple[str, str]] = get_metrics_history(DB_PATH, solver_name, metric_name, limit=limit)
+    history: list[tuple[str, str]] = get_metrics_history(
+        DB_PATH, solver_name, metric_name, limit=limit
+    )
     return [{"timestamp": ts, "value": v} for ts, v in history]
+
 
 @app.get("/api/available_metrics")
 def api_available_metrics(
@@ -505,6 +527,7 @@ def api_available_metrics(
     available_metrics: list[tuple[str, str]] = get_all_metrics_series(DB_PATH)
     return [{"solver": s, "metric": m} for s, m in available_metrics]
 
+
 @app.get("/api/get_job_batch_uuids")
 def api_job_batch_uuids(limit: int = 100):
     """
@@ -513,8 +536,10 @@ def api_job_batch_uuids(limit: int = 100):
 
     return get_job_batch_uuids(DB_PATH, limit=limit)
 
+
 def main():
     import uvicorn
+
     uvicorn.run(
         "basic_restapi.fastapi_app:app",
         host="0.0.0.0",

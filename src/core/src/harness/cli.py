@@ -7,9 +7,15 @@ import sys
 from pathlib import Path
 
 from .add_solver import add_solver
-from .config import ConfigError, load_all, load_resources, load_systems, build_jobs_from_solver_specs
+from .config import (
+    ConfigError,
+    load_all,
+    load_resources,
+    load_systems,
+    build_jobs_from_solver_specs,
+)
 from .runner import RunResult, run_jobs
-from .storage import init_db, start_writer, stop_writer, store_run, get_runs
+from .storage import init_db, db_writer_session, store_run, get_runs
 
 
 def _print_and_build_output(results: list[RunResult], verbose: bool) -> list[dict]:
@@ -159,12 +165,9 @@ def main(argv: list[str] | None = None) -> int:
         results = run_jobs(job_list, solvers, systems, resources=resources)
         if not args.no_store:
             init_db(args.db)
-            start_writer(args.db)
-            try:
+            with db_writer_session(args.db):
                 for r in results:
-                    store_run(args.db, r)
-            finally:
-                stop_writer()
+                    store_run(r)
         output = _print_and_build_output(results, args.verbose)
         print(json.dumps(output, indent=2))
         return 0 if all(r.passed for r in results) else 1
@@ -179,9 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Available solvers:")
         for s in sorted(solvers.values(), key=lambda x: x.name):
             extra = f" default_system={s.default_system}" if s.default_system else ""
-            print(
-                f"  - {s.name}{extra} allowed_systems={s.allowed_systems}"
-            )
+            print(f"  - {s.name}{extra} allowed_systems={s.allowed_systems}")
         return 0
 
     if args.list_runs:
@@ -204,7 +205,9 @@ def main(argv: list[str] | None = None) -> int:
                     err_info = f" | {n} validation error{'s' if n != 1 else ''}"
             except (json.JSONDecodeError, TypeError):
                 pass
-            print(f"  {r['id']}: {r['job_name']} | {status} | {proc} | {r['timestamp']}{err_info}")
+            print(
+                f"  {r['id']}: {r['job_name']} | {status} | {proc} | {r['timestamp']}{err_info}"
+            )
         return 0
 
     solver_names = sorted(solvers.keys())
@@ -254,12 +257,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.no_store:
         init_db(args.db)
-        start_writer(args.db)
-        try:
+        with db_writer_session(args.db):
             for r in results:
-                store_run(args.db, r)
-        finally:
-            stop_writer()
+                store_run(r)
 
     output = _print_and_build_output(results, args.verbose)
     print(json.dumps(output, indent=2))

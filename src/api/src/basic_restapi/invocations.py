@@ -34,7 +34,9 @@ def _get_executor() -> ThreadPoolExecutor:
     global _executor
     with _executor_lock:
         if _executor is None:
-            _executor = ThreadPoolExecutor(max_workers=32, thread_name_prefix="inv-worker")
+            _executor = ThreadPoolExecutor(
+                max_workers=32, thread_name_prefix="inv-worker"
+            )
         return _executor
 
 
@@ -97,8 +99,10 @@ def try_scancel(job_ids: list[str], submit_container: str | None) -> list[str]:
         ]
     if not job_ids:
         return []
-    cont = (submit_container or "").strip() or os.environ.get("DOCKER_SLURM_SUBMIT_CONTAINER") or os.environ.get(
-        "DOCKER_SLURM_CONTAINER", ""
+    cont = (
+        (submit_container or "").strip()
+        or os.environ.get("DOCKER_SLURM_SUBMIT_CONTAINER")
+        or os.environ.get("DOCKER_SLURM_CONTAINER", "")
     )
     for jid in job_ids:
         if cont == "host":
@@ -192,7 +196,6 @@ def start_background_run(
     systems: dict[str, System],
     resources: dict[str, Resource],
     batch_name: str,
-    db_path: str,
     *,
     solver_name: str = "",
     job_names: list[str] | None = None,
@@ -228,7 +231,7 @@ def start_background_run(
                 invoke_ctl=ctl,
             )
             for res in results:
-                store_run(db_path, res)
+                store_run(res)
             r0.results = _results_to_json(results)
             # Only mark cancelled if a job was stopped mid-run (runner sets this on RunResult).
             cancelled = any(
@@ -269,7 +272,9 @@ def get_invocation_execution_status(invocation_id: str) -> dict[str, Any] | None
     out: dict[str, Any] = dict(invocation_to_dict(rec))
     out["scheduler_detail"] = {}
     if ctl.slurm_job_ids:
-        out["scheduler_detail"] = query_slurm_job_state(list(ctl.slurm_job_ids), ctl.submit_container) or {}
+        out["scheduler_detail"] = (
+            query_slurm_job_state(list(ctl.slurm_job_ids), ctl.submit_container) or {}
+        )
     return out
 
 

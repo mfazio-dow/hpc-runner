@@ -1,6 +1,14 @@
 """Execution-agnostic harness for running solver jobs."""
 
-from .config import ConfigError, load_all, Resource, System, Solver, Job, build_jobs_from_solver_specs
+from .config import (
+    ConfigError,
+    load_all,
+    Resource,
+    System,
+    Solver,
+    Job,
+    build_jobs_from_solver_specs,
+)
 from .paths import get_project_root, get_db_path, get_config_dir
 from .runner import run_job, run_jobs, RunResult, InvocationControl
 from .parser import extract_metrics
@@ -8,6 +16,7 @@ from .storage import (
     init_db,
     start_writer,
     stop_writer,
+    db_writer_session,
     store_run,
     get_runs,
     get_run_by_id,
@@ -44,6 +53,7 @@ __all__ = [
     "init_db",
     "start_writer",
     "stop_writer",
+    "db_writer_session",
     "store_run",
     "get_runs",
     "get_run_by_id",

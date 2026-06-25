@@ -5,7 +5,9 @@ import json
 import queue
 import sqlite3
 import threading
+from collections.abc import Generator
 from concurrent.futures import Future
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -164,6 +166,11 @@ def start_writer(db_path: str | Path) -> None:
     global _writer
     with _writer_lock:
         if _writer is not None:
+            if Path(_writer._db_path) != Path(db_path):
+                raise RuntimeError(
+                    f"DBWriter already active for {_writer._db_path!r}; "
+                    f"cannot start for {db_path!r}"
+                )
             return
         _writer = DBWriter(db_path)
         _writer.start()
@@ -178,11 +185,29 @@ def stop_writer() -> None:
         w.stop()
 
 
-def _enqueue_write(sql: str, params: tuple = ()) -> Future:
+@contextmanager
+def db_writer_session(db_path: str | Path) -> Generator[None, None, None]:
+    start_writer(db_path)
+    try:
+        yield
+    finally:
+        stop_writer()
+
+
+def _require_writer() -> DBWriter:
     w = _writer
     if w is None:
         raise RuntimeError("DBWriter not started — call start_writer() first")
-    return w.enqueue(sql, params)
+    return w
+
+
+def _get_writer_db_path() -> str:
+    """Return the db path the active writer is connected to."""
+    return _require_writer()._db_path
+
+
+def _enqueue_write(sql: str, params: tuple = ()) -> Future:
+    return _require_writer().enqueue(sql, params)
 
 
 # ---------------------------------------------------------------------------
@@ -192,10 +217,7 @@ def _enqueue_write(sql: str, params: tuple = ()) -> Future:
 
 def _enqueue_multi_write(statements: list[tuple[str, tuple]]) -> Future:
     """Submit multiple SQL statements as a single atomic unit in one transaction."""
-    w = _writer
-    if w is None:
-        raise RuntimeError("DBWriter not started — call start_writer() first")
-    return w.enqueue_atomic(statements)
+    return _require_writer().enqueue_atomic(statements)
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +294,7 @@ def init_db(path: str | Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def store_run(db_path: str | Path, result: RunResult) -> int:
+def store_run(result: RunResult) -> int:
     """Store a run result and return the inserted row id."""
     metrics_json = json.dumps(result.metrics) if result.metrics else None
     validation_errors_json = json.dumps(result.validation_errors or [])
@@ -325,7 +347,7 @@ def store_run(db_path: str | Path, result: RunResult) -> int:
     return lastrowid
 
 
-def delete_runs(db_path: str | Path, run_ids: list[int]) -> int:
+def delete_runs(run_ids: list[int]) -> int:
     """Delete runs by primary key. Returns the number of rows deleted."""
     if not run_ids:
         return 0
@@ -339,8 +361,9 @@ def delete_runs(db_path: str | Path, run_ids: list[int]) -> int:
     return rowcount
 
 
-def set_baseline_run(db_path: str | Path, run_id: int) -> dict[str, Any] | None:
+def set_baseline_run(run_id: int) -> dict[str, Any] | None:
     """Set a specific run as the baseline for its solver."""
+    db_path = _get_writer_db_path()
     with _connect_readonly(db_path) as conn:
         row = conn.execute(
             "SELECT id, solver_name FROM runs WHERE id = ?", (run_id,)
@@ -360,9 +383,7 @@ def set_baseline_run(db_path: str | Path, run_id: int) -> dict[str, Any] | None:
     return _run_to_response(dict(updated))
 
 
-def upsert_matrix_preset(
-    db_path: str | Path, label: str, cells: list[dict[str, Any]]
-) -> None:
+def upsert_matrix_preset(label: str, cells: list[dict[str, Any]]) -> None:
     """Insert or replace a Run Matrix preset."""
     key = _normalize_matrix_preset_label(label)
     if not key:
@@ -382,7 +403,7 @@ def upsert_matrix_preset(
     fut.result()  # wait for completion
 
 
-def delete_matrix_preset(db_path: str | Path, label: str) -> int:
+def delete_matrix_preset(label: str) -> int:
     """Delete preset by normalized label. Returns rowcount (0 if missing)."""
     key = _normalize_matrix_preset_label(label)
     if not key:

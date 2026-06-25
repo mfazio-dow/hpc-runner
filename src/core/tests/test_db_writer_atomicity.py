@@ -68,7 +68,7 @@ def test_concurrent_baseline_writes_single_winner(db_path):
 
         def _store_baseline(name: str) -> int:
             barrier.wait()
-            return store_run(db_path, _make_result(job_name=name, baseline=True))
+            return store_run(_make_result(job_name=name, baseline=True))
 
         with ThreadPoolExecutor(max_workers=num_workers) as pool:
             futures = [
@@ -304,14 +304,14 @@ def test_compound_and_single_items_coexist_in_batch(db_path):
 
 def test_concurrent_set_baseline_run_single_winner(db_path):
     """Two concurrent set_baseline_run calls for the same solver leave one baseline."""
-    id1 = store_run(db_path, _make_result(job_name="run-1", baseline=False))
-    id2 = store_run(db_path, _make_result(job_name="run-2", baseline=False))
+    id1 = store_run(_make_result(job_name="run-1", baseline=False))
+    id2 = store_run(_make_result(job_name="run-2", baseline=False))
 
     barrier = threading.Barrier(2, timeout=5)
 
     def _set_baseline(run_id: int) -> None:
         barrier.wait()
-        set_baseline_run(db_path, run_id)
+        set_baseline_run(run_id)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         f1 = pool.submit(_set_baseline, id1)
