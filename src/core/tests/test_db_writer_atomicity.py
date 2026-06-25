@@ -1,0 +1,370 @@
+# tests/test_db_writer_atomicity.py - Concurrency and atomicity tests for DBWriter
+from __future__ import annotations
+
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+from harness import RunResult
+from harness.storage import (
+    get_run_by_id,
+    get_runs,
+    init_db,
+    set_baseline_run,
+    start_writer,
+    stop_writer,
+    store_run,
+)
+
+
+@pytest.fixture()
+def db_path(tmp_path):
+    path = tmp_path / "test.db"
+    init_db(path)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def _writer(db_path):
+    start_writer(db_path)
+    yield
+    stop_writer()
+
+
+def _make_result(
+    job_name: str = "j1",
+    solver_name: str = "s1",
+    baseline: bool = False,
+) -> RunResult:
+    return RunResult(
+        job_name=job_name,
+        solver_name=solver_name,
+        system_name="dev",
+        returncode=0,
+        stdout="",
+        stderr="",
+        runtime_seconds=1.0,
+        timestamp="2026-06-25T00:00:00+00:00",
+        validation_errors=[],
+        passed=True,
+        metrics={},
+        processor="x86_64",
+        baseline=baseline,
+        job_batch_uuid="batch-1",
+    )
+
+
+def test_concurrent_baseline_writes_single_winner(db_path):
+    """Two threads storing baseline runs for the same solver must leave exactly one baseline.
+
+    Run multiple rounds to increase the chance of triggering the interleaving.
+    """
+    num_workers = 4
+    rounds = 20
+
+    for round_num in range(rounds):
+        barrier = threading.Barrier(num_workers, timeout=5)
+
+        def _store_baseline(name: str) -> int:
+            barrier.wait()
+            return store_run(db_path, _make_result(job_name=name, baseline=True))
+
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = [
+                pool.submit(_store_baseline, f"round{round_num}-worker{i}")
+                for i in range(num_workers)
+            ]
+            for f in futures:
+                f.result(timeout=10)
+
+        runs = get_runs(db_path, solver="s1")
+        baseline_runs = [r for r in runs if r.get("is_baseline")]
+        assert len(baseline_runs) == 1, (
+            f"Round {round_num}: Expected exactly 1 baseline row, got "
+            f"{len(baseline_runs)}: {[r['job_name'] for r in baseline_runs]}"
+        )
+
+
+def test_enqueue_atomic_prevents_interleaving(db_path):
+    """Verify that enqueue_atomic keeps multi-statement groups indivisible.
+
+    Even when two atomic envelopes are submitted concurrently, each envelope's
+    statements execute together — the second envelope's UPDATE clears the first
+    envelope's INSERT, leaving exactly one baseline.
+    """
+    from harness.storage.db import _writer
+
+    assert _writer is not None
+    w = _writer
+
+    solver = "s1"
+    insert_sql = """
+        INSERT INTO runs (
+            job_name, solver_name, system_name, returncode, passed,
+            runtime_seconds, timestamp, stdout, stderr, metrics_json,
+            processor, validation_errors, is_baseline, job_batch_uuid
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    base_params = (
+        "dev",
+        0,
+        1,
+        1.0,
+        "2026-06-25T00:00:00+00:00",
+        "",
+        "",
+        "{}",
+        "x86_64",
+        "[]",
+    )
+
+    # Two atomic envelopes — each is UPDATE + INSERT as a single queue item
+    fut_a = w.enqueue_atomic(
+        [
+            ("UPDATE runs SET is_baseline = 0 WHERE solver_name = ?", (solver,)),
+            (insert_sql, ("run-a", solver, *base_params, 1, "batch-1")),
+        ]
+    )
+    fut_b = w.enqueue_atomic(
+        [
+            ("UPDATE runs SET is_baseline = 0 WHERE solver_name = ?", (solver,)),
+            (insert_sql, ("run-b", solver, *base_params, 1, "batch-1")),
+        ]
+    )
+
+    fut_a.result(timeout=5)
+    fut_b.result(timeout=5)
+
+    runs = get_runs(db_path, solver=solver)
+    baseline_runs = [r for r in runs if r.get("is_baseline")]
+    assert len(baseline_runs) == 1, (
+        f"Expected exactly 1 baseline row, got {len(baseline_runs)}: "
+        f"{[r['job_name'] for r in baseline_runs]}"
+    )
+
+
+def test_enqueue_atomic_error_sets_future_exception(db_path):
+    """If any statement in a compound envelope fails, the future gets the exception."""
+    from harness.storage.db import _writer
+
+    assert _writer is not None
+    w = _writer
+
+    fut = w.enqueue_atomic(
+        [
+            (
+                "INSERT INTO runs (job_name, solver_name, system_name, returncode, passed, "
+                "runtime_seconds, timestamp, is_baseline, job_batch_uuid) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ok-row",
+                    "s1",
+                    "dev",
+                    0,
+                    1,
+                    1.0,
+                    "2026-01-01T00:00:00+00:00",
+                    0,
+                    "b1",
+                ),
+            ),
+            ("INSERT INTO nonexistent_table VALUES (?)", ("boom",)),
+        ]
+    )
+
+    with pytest.raises(Exception, match="nonexistent_table"):
+        fut.result(timeout=5)
+
+
+def test_enqueue_atomic_returns_last_statement_result(db_path):
+    """The future resolves to (lastrowid, rowcount) of the last statement."""
+    from harness.storage.db import _writer
+
+    assert _writer is not None
+    w = _writer
+
+    fut = w.enqueue_atomic(
+        [
+            (
+                "INSERT INTO runs (job_name, solver_name, system_name, returncode, passed, "
+                "runtime_seconds, timestamp, is_baseline, job_batch_uuid) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("first", "s1", "dev", 0, 1, 1.0, "2026-01-01T00:00:00+00:00", 0, "b1"),
+            ),
+            (
+                "INSERT INTO runs (job_name, solver_name, system_name, returncode, passed, "
+                "runtime_seconds, timestamp, is_baseline, job_batch_uuid) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "second",
+                    "s1",
+                    "dev",
+                    0,
+                    1,
+                    1.0,
+                    "2026-01-01T00:00:00+00:00",
+                    0,
+                    "b1",
+                ),
+            ),
+        ]
+    )
+
+    lastrowid, rowcount = fut.result(timeout=5)
+    assert lastrowid == 2
+    assert rowcount == 1
+
+
+def test_single_enqueue_still_works(db_path):
+    """The existing single-statement enqueue path remains functional."""
+    from harness.storage.db import _writer
+
+    assert _writer is not None
+    w = _writer
+
+    fut = w.enqueue(
+        "INSERT INTO runs (job_name, solver_name, system_name, returncode, passed, "
+        "runtime_seconds, timestamp, is_baseline, job_batch_uuid) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("single", "s1", "dev", 0, 1, 1.0, "2026-01-01T00:00:00+00:00", 0, "b1"),
+    )
+
+    lastrowid, rowcount = fut.result(timeout=5)
+    assert lastrowid == 1
+    assert rowcount == 1
+
+    run = get_run_by_id(db_path, lastrowid)
+    assert run is not None
+    assert run["job_name"] == "single"
+
+
+def test_compound_and_single_items_coexist_in_batch(db_path):
+    """Single items and compound envelopes can coexist in the same batch."""
+    from harness.storage.db import _writer
+
+    assert _writer is not None
+    w = _writer
+
+    insert_sql = (
+        "INSERT INTO runs (job_name, solver_name, system_name, returncode, passed, "
+        "runtime_seconds, timestamp, is_baseline, job_batch_uuid) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    fut1 = w.enqueue(
+        insert_sql,
+        ("single-1", "s1", "dev", 0, 1, 1.0, "2026-01-01T00:00:00+00:00", 0, "b1"),
+    )
+    fut2 = w.enqueue_atomic(
+        [
+            (
+                insert_sql,
+                (
+                    "atomic-1",
+                    "s1",
+                    "dev",
+                    0,
+                    1,
+                    1.0,
+                    "2026-01-01T00:00:00+00:00",
+                    0,
+                    "b1",
+                ),
+            ),
+            (
+                insert_sql,
+                (
+                    "atomic-2",
+                    "s1",
+                    "dev",
+                    0,
+                    1,
+                    1.0,
+                    "2026-01-01T00:00:00+00:00",
+                    0,
+                    "b1",
+                ),
+            ),
+        ]
+    )
+    fut3 = w.enqueue(
+        insert_sql,
+        ("single-2", "s1", "dev", 0, 1, 1.0, "2026-01-01T00:00:00+00:00", 0, "b1"),
+    )
+
+    fut1.result(timeout=5)
+    fut2.result(timeout=5)
+    fut3.result(timeout=5)
+
+    runs = get_runs(db_path, solver="s1")
+    job_names = sorted(r["job_name"] for r in runs)
+    assert job_names == ["atomic-1", "atomic-2", "single-1", "single-2"]
+
+
+def test_concurrent_set_baseline_run_single_winner(db_path):
+    """Two concurrent set_baseline_run calls for the same solver leave one baseline."""
+    id1 = store_run(db_path, _make_result(job_name="run-1", baseline=False))
+    id2 = store_run(db_path, _make_result(job_name="run-2", baseline=False))
+
+    barrier = threading.Barrier(2, timeout=5)
+
+    def _set_baseline(run_id: int) -> None:
+        barrier.wait()
+        set_baseline_run(db_path, run_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(_set_baseline, id1)
+        f2 = pool.submit(_set_baseline, id2)
+        f1.result(timeout=10)
+        f2.result(timeout=10)
+
+    runs = get_runs(db_path, solver="s1")
+    baseline_runs = [r for r in runs if r.get("is_baseline")]
+    assert len(baseline_runs) == 1
+
+
+def test_stop_with_pending_compound_envelope(db_path):
+    """Compound envelopes enqueued before stop() execute before shutdown."""
+    from harness.storage.db import _writer
+
+    assert _writer is not None
+    w = _writer
+
+    insert_sql = (
+        "INSERT INTO runs (job_name, solver_name, system_name, returncode, passed, "
+        "runtime_seconds, timestamp, is_baseline, job_batch_uuid) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    fut = w.enqueue_atomic(
+        [
+            (
+                insert_sql,
+                (
+                    "before-stop",
+                    "s1",
+                    "dev",
+                    0,
+                    1,
+                    1.0,
+                    "2026-01-01T00:00:00+00:00",
+                    0,
+                    "b1",
+                ),
+            ),
+        ]
+    )
+
+    stop_writer()
+
+    lastrowid, _ = fut.result(timeout=5)
+    assert lastrowid > 0
+
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute(
+        "SELECT job_name FROM runs WHERE id = ?", (lastrowid,)
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row[0] == "before-stop"

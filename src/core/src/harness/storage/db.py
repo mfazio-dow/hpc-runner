@@ -16,10 +16,16 @@ from ..runner import RunResult
 
 logger = structlog.get_logger()
 
+# Queue item types for DBWriter
+_SingleItem = tuple[str, tuple, Future]
+_CompoundItem = tuple[list[tuple[str, tuple]], Future]
+_QueueItem = _SingleItem | _CompoundItem | None
+
 
 # ---------------------------------------------------------------------------
 # Read-only connection helper
 # ---------------------------------------------------------------------------
+
 
 def _connect_readonly(path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), timeout=30)
@@ -31,10 +37,11 @@ def _connect_readonly(path: str | Path) -> sqlite3.Connection:
 # DBWriter — single dedicated writer thread backed by a queue
 # ---------------------------------------------------------------------------
 
+
 class DBWriter:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
-        self._queue: queue.Queue[tuple[str, tuple, Future] | None] = queue.Queue()
+        self._queue: queue.Queue[_QueueItem] = queue.Queue()
         self._thread = threading.Thread(target=self._run, daemon=True, name="db-writer")
         self._started = False
 
@@ -56,55 +63,20 @@ class DBWriter:
         self._queue.put((sql, params, fut))
         return fut
 
+    def enqueue_atomic(self, statements: list[tuple[str, tuple]]) -> Future:
+        """Enqueue multiple statements as a single indivisible unit."""
+        fut: Future = Future()
+        self._queue.put((statements, fut))
+        return fut
+
     def _run(self) -> None:
         conn = sqlite3.connect(self._db_path, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         try:
             while True:
-                item = self._queue.get()
-                if item is None:
-                    break
-                batch: list[tuple[str, tuple, Future]] = [item]
-                while True:
-                    try:
-                        nxt = self._queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if nxt is None:
-                        batch.append(nxt)  # type: ignore[arg-type]
-                        break
-                    batch.append(nxt)
-
-                stop = False
-                try:
-                    conn.execute("BEGIN")
-                    for entry in batch:
-                        if entry is None:
-                            stop = True
-                            continue
-                        sql, params, fut = entry
-                        try:
-                            cur = conn.execute(sql, params)
-                            fut.set_result((cur.lastrowid or 0, cur.rowcount))
-                        except Exception as exc:
-                            logger.error("db_writer.exec_error", sql=sql[:120], error=str(exc))
-                            fut.set_exception(exc)
-                    conn.commit()
-                except Exception as exc:
-                    logger.error("db_writer.batch_error", error=str(exc))
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    for entry in batch:
-                        if entry is None:
-                            stop = True
-                            continue
-                        _, _, fut = entry
-                        if not fut.done():
-                            fut.set_exception(exc)
-
+                batch, stop = self._drain_batch()
+                self._execute_batch(conn, batch)
                 if stop:
                     break
         finally:
@@ -112,6 +84,76 @@ class DBWriter:
                 conn.close()
             except Exception:
                 pass
+
+    def _drain_batch(self) -> tuple[list[_SingleItem | _CompoundItem], bool]:
+        item = self._queue.get()
+        if item is None:
+            return [], True
+        batch: list[_SingleItem | _CompoundItem] = [item]
+        while True:
+            try:
+                nxt = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if nxt is None:
+                return batch, True
+            batch.append(nxt)
+        return batch, False
+
+    def _execute_batch(
+        self, conn: sqlite3.Connection, batch: list[_SingleItem | _CompoundItem]
+    ) -> None:
+        if not batch:
+            return
+        try:
+            conn.execute("BEGIN")
+            for entry in batch:
+                if len(entry) == 3:
+                    self._execute_single(conn, entry)  # type: ignore[arg-type]
+                else:
+                    self._execute_compound(conn, entry)  # type: ignore[arg-type]
+            conn.commit()
+        except Exception as exc:
+            logger.error("db_writer.batch_error", error=str(exc))
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            self._rollback_futures(batch, exc)
+
+    def _execute_single(self, conn: sqlite3.Connection, entry: _SingleItem) -> None:
+        sql, params, fut = entry
+        try:
+            cur = conn.execute(sql, params)
+            fut.set_result((cur.lastrowid or 0, cur.rowcount))
+        except Exception as exc:
+            logger.error("db_writer.exec_error", sql=sql[:120], error=str(exc))
+            fut.set_exception(exc)
+
+    def _execute_compound(self, conn: sqlite3.Connection, entry: _CompoundItem) -> None:
+        statements, fut = entry
+        if not statements:
+            fut.set_result((0, 0))
+            return
+        try:
+            cur = None
+            for sql, params in statements:
+                cur = conn.execute(sql, params)
+            fut.set_result((cur.lastrowid or 0, cur.rowcount))  # type: ignore[union-attr]
+        except Exception as exc:
+            logger.error("db_writer.exec_error", sql=sql[:120], error=str(exc))  # type: ignore[possibly-undefined]
+            fut.set_exception(exc)
+
+    def _rollback_futures(
+        self, batch: list[_SingleItem | _CompoundItem], exc: Exception
+    ) -> None:
+        for entry in batch:
+            if len(entry) == 3:
+                _, _, fut = entry  # type: ignore[misc]
+            else:
+                _, fut = entry  # type: ignore[misc]
+            if not fut.done():
+                fut.set_exception(exc)
 
 
 _writer: DBWriter | None = None
@@ -147,27 +189,19 @@ def _enqueue_write(sql: str, params: tuple = ()) -> Future:
 # Multi-statement write helper (for operations needing >1 SQL in one tx)
 # ---------------------------------------------------------------------------
 
-def _enqueue_multi_write(statements: list[tuple[str, tuple]]) -> Future:
-    """Submit multiple SQL statements that must execute in the same transaction.
 
-    Enqueues them individually; they'll land in the same batch/transaction since
-    nothing else can interleave between successive put() calls on the same thread.
-    The last Future is returned (represents the final statement's lastrowid).
-    """
+def _enqueue_multi_write(statements: list[tuple[str, tuple]]) -> Future:
+    """Submit multiple SQL statements as a single atomic unit in one transaction."""
     w = _writer
     if w is None:
         raise RuntimeError("DBWriter not started — call start_writer() first")
-    fut: Future = Future()
-    for sql, params in statements[:-1]:
-        w.enqueue(sql, params)
-    last_sql, last_params = statements[-1]
-    fut = w.enqueue(last_sql, last_params)
-    return fut
+    return w.enqueue_atomic(statements)
 
 
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
+
 
 def init_db(path: str | Path) -> None:
     """Create tables if they don't exist. Enable WAL mode."""
@@ -213,7 +247,9 @@ def init_db(path: str | Path) -> None:
         if "validation_errors" not in columns:
             conn.execute("ALTER TABLE runs ADD COLUMN validation_errors TEXT")
         if "is_baseline" not in columns:
-            conn.execute("ALTER TABLE runs ADD COLUMN is_baseline INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                "ALTER TABLE runs ADD COLUMN is_baseline INTEGER NOT NULL DEFAULT 0"
+            )
         if "job_batch_uuid" not in columns:
             conn.execute("ALTER TABLE runs ADD COLUMN job_batch_uuid TEXT NOT NULL")
         if "job_batch_date" not in columns:
@@ -234,6 +270,7 @@ def init_db(path: str | Path) -> None:
 # ---------------------------------------------------------------------------
 # Write functions — routed through the writer queue
 # ---------------------------------------------------------------------------
+
 
 def store_run(db_path: str | Path, result: RunResult) -> int:
     """Store a run result and return the inserted row id."""
@@ -305,7 +342,9 @@ def delete_runs(db_path: str | Path, run_ids: list[int]) -> int:
 def set_baseline_run(db_path: str | Path, run_id: int) -> dict[str, Any] | None:
     """Set a specific run as the baseline for its solver."""
     with _connect_readonly(db_path) as conn:
-        row = conn.execute("SELECT id, solver_name FROM runs WHERE id = ?", (run_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, solver_name FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
     if row is None:
         return None
     solver_name = row[1]
@@ -359,6 +398,7 @@ def delete_matrix_preset(db_path: str | Path, label: str) -> int:
 # ---------------------------------------------------------------------------
 # Read functions — direct connections (WAL allows concurrent readers)
 # ---------------------------------------------------------------------------
+
 
 def get_runs(
     db_path: str | Path,
@@ -427,7 +467,9 @@ def get_solver_run_summaries(db_path: str | Path) -> list[dict[str, Any]]:
         return summaries
 
 
-def get_all_metrics_series(db_path: str | Path, limit: int = 500) -> list[tuple[str, str]]:
+def get_all_metrics_series(
+    db_path: str | Path, limit: int = 500
+) -> list[tuple[str, str]]:
     """Discover all (solver_name, metric_name) pairs that have data."""
     with _connect_readonly(db_path) as conn:
         rows = conn.execute(
@@ -472,8 +514,10 @@ def get_metrics_history(
     for ts, mj in rows:
         try:
             m = json.loads(mj or "{}")
-            if metric_name in m and not isinstance(m[metric_name], bool) and isinstance(
-                m[metric_name], (int, float)
+            if (
+                metric_name in m
+                and not isinstance(m[metric_name], bool)
+                and isinstance(m[metric_name], (int, float))
             ):
                 result.append((ts, float(m[metric_name])))
         except json.JSONDecodeError:
@@ -531,18 +575,22 @@ def get_baseline_comparison(
                 (solver_name,),
             ).fetchall()
         else:
-            solvers_rows = conn.execute("SELECT DISTINCT solver_name FROM runs").fetchall()
+            solvers_rows = conn.execute(
+                "SELECT DISTINCT solver_name FROM runs"
+            ).fetchall()
     solvers_list = [r[0] for r in solvers_rows]
     result: list[dict[str, Any]] = []
     for sname in solvers_list:
         baseline = get_baseline_run(db_path, sname)
         if not baseline:
-            result.append({
-                "solver_name": sname,
-                "baseline_run": None,
-                "other_runs": [],
-                "comparisons": [],
-            })
+            result.append(
+                {
+                    "solver_name": sname,
+                    "baseline_run": None,
+                    "other_runs": [],
+                    "comparisons": [],
+                }
+            )
             continue
         baseline_metrics = baseline.get("metrics") or {}
         with _connect_readonly(db_path) as conn:
@@ -568,20 +616,29 @@ def get_baseline_comparison(
                 val_f = float(val)
                 delta = val_f - base_f
                 delta_pct = (100.0 * delta / base_f) if base_f != 0 else None
-                vs[k] = {"baseline": base_f, "value": val_f, "delta": delta, "delta_pct": delta_pct}
-            comparisons.append({
-                "run_id": r["id"],
-                "job_name": r["job_name"],
-                "timestamp": r["timestamp"],
-                "metrics": r["metrics"],
-                "vs_baseline": vs,
-            })
-        result.append({
-            "solver_name": sname,
-            "baseline_run": baseline,
-            "other_runs": other_runs_decoded,
-            "comparisons": comparisons,
-        })
+                vs[k] = {
+                    "baseline": base_f,
+                    "value": val_f,
+                    "delta": delta,
+                    "delta_pct": delta_pct,
+                }
+            comparisons.append(
+                {
+                    "run_id": r["id"],
+                    "job_name": r["job_name"],
+                    "timestamp": r["timestamp"],
+                    "metrics": r["metrics"],
+                    "vs_baseline": vs,
+                }
+            )
+        result.append(
+            {
+                "solver_name": sname,
+                "baseline_run": baseline,
+                "other_runs": other_runs_decoded,
+                "comparisons": comparisons,
+            }
+        )
     return result
 
 
