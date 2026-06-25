@@ -324,6 +324,59 @@ def test_concurrent_set_baseline_run_single_winner(db_path):
     assert len(baseline_runs) == 1
 
 
+def test_batch_rollback_rejects_all_futures_including_earlier_items(db_path):
+    """When a later item in a batch causes rollback, earlier items' futures must NOT resolve.
+
+    Regression test: prior to the fix, _execute_single called fut.set_result() eagerly
+    *inside* the open transaction. If a subsequent item in the same batch raised, the
+    transaction was rolled back but the earlier future had already been resolved with a
+    phantom lastrowid pointing to a row that no longer exists.
+    """
+    from harness.storage.db import _writer
+
+    assert _writer is not None
+    w = _writer
+
+    insert_sql = (
+        "INSERT INTO runs (job_name, solver_name, system_name, returncode, passed, "
+        "runtime_seconds, timestamp, is_baseline, job_batch_uuid) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    # Block the writer thread so both items land in the queue before it drains
+    blocker = w.enqueue(
+        insert_sql,
+        ("blocker", "s1", "dev", 0, 1, 1.0, "2026-01-01T00:00:00+00:00", 0, "b1"),
+    )
+    blocker.result(timeout=5)  # ensure the writer has processed the blocker batch
+
+    # Now enqueue two items that will coalesce into the SAME batch:
+    # item 1 is valid SQL, item 2 references a nonexistent table
+    fut_good = w.enqueue(
+        insert_sql,
+        ("good-row", "s1", "dev", 0, 1, 1.0, "2026-01-01T00:00:00+00:00", 0, "b1"),
+    )
+    fut_bad = w.enqueue(
+        "INSERT INTO nonexistent_table VALUES (?)",
+        ("boom",),
+    )
+
+    # Both futures must raise — the entire batch was rolled back
+    with pytest.raises(Exception):
+        fut_good.result(timeout=5)
+
+    with pytest.raises(Exception):
+        fut_bad.result(timeout=5)
+
+    # The "good-row" must NOT exist in the database — it was rolled back
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute(
+        "SELECT id FROM runs WHERE job_name = ?", ("good-row",)
+    ).fetchone()
+    conn.close()
+    assert row is None, "Row from rolled-back transaction must not exist in DB"
+
+
 def test_stop_with_pending_compound_envelope(db_path):
     """Compound envelopes enqueued before stop() execute before shutdown."""
     from harness.storage.db import _writer

@@ -107,13 +107,25 @@ class DBWriter:
     ) -> None:
         if not batch:
             return
+        pending: list[tuple[Future, tuple[int, int]]] = []
         try:
             conn.execute("BEGIN")
             for entry in batch:
                 if len(entry) == 3:
-                    self._execute_single(conn, entry)  # type: ignore[arg-type]
+                    sql, params, fut = entry  # type: ignore[misc]
+                    cur = conn.execute(sql, params)
+                    pending.append((fut, (cur.lastrowid or 0, cur.rowcount)))
                 else:
-                    self._execute_compound(conn, entry)  # type: ignore[arg-type]
+                    statements, fut = entry  # type: ignore[misc]
+                    if not statements:
+                        pending.append((fut, (0, 0)))
+                        continue
+                    cur = None
+                    for sql, params in statements:
+                        cur = conn.execute(sql, params)
+                    pending.append(
+                        (fut, (cur.lastrowid or 0, cur.rowcount))  # type: ignore[union-attr]
+                    )
             conn.commit()
         except Exception as exc:
             logger.error("db_writer.batch_error", error=str(exc))
@@ -121,41 +133,13 @@ class DBWriter:
                 conn.rollback()
             except Exception:
                 pass
-            self._rollback_futures(batch, exc)
-
-    def _execute_single(self, conn: sqlite3.Connection, entry: _SingleItem) -> None:
-        sql, params, fut = entry
-        try:
-            cur = conn.execute(sql, params)
-            fut.set_result((cur.lastrowid or 0, cur.rowcount))
-        except Exception as exc:
-            logger.error("db_writer.exec_error", sql=sql[:120], error=str(exc))
-            fut.set_exception(exc)
-
-    def _execute_compound(self, conn: sqlite3.Connection, entry: _CompoundItem) -> None:
-        statements, fut = entry
-        if not statements:
-            fut.set_result((0, 0))
+            for entry in batch:
+                fut = entry[2] if len(entry) == 3 else entry[1]  # type: ignore[misc]
+                if not fut.done():
+                    fut.set_exception(exc)
             return
-        try:
-            cur = None
-            for sql, params in statements:
-                cur = conn.execute(sql, params)
-            fut.set_result((cur.lastrowid or 0, cur.rowcount))  # type: ignore[union-attr]
-        except Exception as exc:
-            logger.error("db_writer.exec_error", sql=sql[:120], error=str(exc))  # type: ignore[possibly-undefined]
-            fut.set_exception(exc)
-
-    def _rollback_futures(
-        self, batch: list[_SingleItem | _CompoundItem], exc: Exception
-    ) -> None:
-        for entry in batch:
-            if len(entry) == 3:
-                _, _, fut = entry  # type: ignore[misc]
-            else:
-                _, fut = entry  # type: ignore[misc]
-            if not fut.done():
-                fut.set_exception(exc)
+        for fut, result in pending:
+            fut.set_result(result)
 
 
 _writer: DBWriter | None = None
