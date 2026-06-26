@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from harness import RunResult
 from harness.storage import (
+    delete_runs,
     get_run_by_id,
     get_runs,
     init_db,
@@ -375,6 +376,82 @@ def test_batch_rollback_rejects_all_futures_including_earlier_items(db_path):
     ).fetchone()
     conn.close()
     assert row is None, "Row from rolled-back transaction must not exist in DB"
+
+
+def test_set_baseline_run_after_delete_no_stale_read(db_path, monkeypatch):
+    """set_baseline_run must not use a stale read when the run is deleted concurrently.
+
+    Regression test for TOCTOU race: the old implementation read the solver_name
+    outside the writer queue, then enqueued the write separately. If a delete
+    landed between those two operations, the UPDATE silently matched zero rows
+    and the old baseline was cleared even though no new baseline was set.
+
+    This test forces the interleaving deterministically: it hooks _enqueue_multi_write
+    to delete the target run AFTER the read but BEFORE the write executes.
+    The correct behavior is: either set_baseline_run returns None (detecting the
+    deletion) OR the existing baseline is preserved (never left with zero baselines
+    when one existed before, unless the fix returns None to signal failure).
+    """
+    import harness.storage.db as db_mod
+
+    id1 = store_run(_make_result(job_name="baseline-candidate", solver_name="s1"))
+    store_run(
+        _make_result(job_name="existing-baseline", solver_name="s1", baseline=True)
+    )
+
+    original_enqueue_multi = db_mod._enqueue_multi_write
+
+    def _intercept_and_delete(statements):
+        # Delete the target run AFTER set_baseline_run has read it but BEFORE
+        # the write executes — this simulates the TOCTOU gap.
+        delete_runs([id1])
+        return original_enqueue_multi(statements)
+
+    monkeypatch.setattr(db_mod, "_enqueue_multi_write", _intercept_and_delete)
+
+    result = set_baseline_run(id1)
+
+    # The function MUST detect that the row is gone and return None.
+    # The old buggy code would clear the existing baseline (UPDATE SET 0)
+    # and then fail to set a new one, leaving the solver with NO baseline
+    # but returning None only because the post-write SELECT found nothing.
+    assert result is None
+
+    # Critical invariant: since the operation failed, the OLD baseline must
+    # still be in place — we must not have cleared it.
+    runs = get_runs(db_path, solver="s1")
+    baseline_runs = [r for r in runs if r.get("is_baseline")]
+    assert len(baseline_runs) == 1, (
+        f"Old baseline must be preserved when set_baseline_run fails, "
+        f"got {len(baseline_runs)} baselines"
+    )
+
+
+def test_set_baseline_run_nonexistent_returns_none(db_path):
+    """set_baseline_run on a run_id that never existed returns None."""
+    result = set_baseline_run(9999)
+    assert result is None
+
+
+def test_set_baseline_run_atomic_clears_old_baseline(db_path):
+    """set_baseline_run atomically clears old baseline and sets the new one.
+
+    This verifies the fix works correctly in the happy path: the subquery-based
+    UPDATE correctly identifies the solver from run_id without a separate read.
+    """
+    store_run(_make_result(job_name="first", solver_name="solverA", baseline=True))
+    id2 = store_run(_make_result(job_name="second", solver_name="solverA"))
+
+    result = set_baseline_run(id2)
+
+    assert result is not None
+    assert result["id"] == id2
+    assert result["is_baseline"] is True
+
+    runs = get_runs(db_path, solver="solverA")
+    baseline_runs = [r for r in runs if r.get("is_baseline")]
+    assert len(baseline_runs) == 1
+    assert baseline_runs[0]["id"] == id2
 
 
 def test_stop_with_pending_compound_envelope(db_path):

@@ -115,9 +115,7 @@ class DBWriter:
             batch.append(nxt)
         return batch, False
 
-    def _execute_batch(
-        self, conn: sqlite3.Connection, batch: list[_WorkItem]
-    ) -> None:
+    def _execute_batch(self, conn: sqlite3.Connection, batch: list[_WorkItem]) -> None:
         if not batch:
             return
         pending: list[tuple[Future, tuple[int, int]]] = []
@@ -357,24 +355,26 @@ def delete_runs(run_ids: list[int]) -> int:
 
 def set_baseline_run(run_id: int) -> dict[str, Any] | None:
     """Set a specific run as the baseline for its solver."""
+    stmts: list[tuple[str, tuple]] = [
+        (
+            """UPDATE runs SET is_baseline = 0
+               WHERE solver_name = (SELECT solver_name FROM runs WHERE id = ?)
+                 AND id != ?""",
+            (run_id, run_id),
+        ),
+        (
+            "UPDATE runs SET is_baseline = 1 WHERE id = ?",
+            (run_id,),
+        ),
+    ]
+    _, rowcount = _enqueue_multi_write(stmts).result()
+    if rowcount == 0:
+        return None
+
     db_path = _get_writer_db_path()
     with _connect_readonly(db_path) as conn:
-        row = conn.execute(
-            "SELECT id, solver_name FROM runs WHERE id = ?", (run_id,)
-        ).fetchone()
-    if row is None:
-        return None
-    solver_name = row[1]
-
-    stmts: list[tuple[str, tuple]] = [
-        ("UPDATE runs SET is_baseline = 0 WHERE solver_name = ?", (solver_name,)),
-        ("UPDATE runs SET is_baseline = 1 WHERE id = ?", (run_id,)),
-    ]
-    _enqueue_multi_write(stmts).result()  # wait for completion
-
-    with _connect_readonly(db_path) as conn:
         updated = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-    return _run_to_response(dict(updated))
+    return _run_to_response(dict(updated)) if updated else None
 
 
 def upsert_matrix_preset(label: str, cells: list[dict[str, Any]]) -> None:
