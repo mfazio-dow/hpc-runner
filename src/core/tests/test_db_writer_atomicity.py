@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 from harness import RunResult
@@ -452,6 +452,62 @@ def test_set_baseline_run_atomic_clears_old_baseline(db_path):
     baseline_runs = [r for r in runs if r.get("is_baseline")]
     assert len(baseline_runs) == 1
     assert baseline_runs[0]["id"] == id2
+
+
+def test_drain_batch_mid_drain_sentinel_flushes_pending(db_path):
+    """Items enqueued before the stop sentinel mid-drain are all committed.
+
+    Regression test for the "drain-before-stop" semantic: when _drain_batch
+    encounters the stop sentinel after already accumulating items, it must
+    return those items (not discard them) so _run() flushes them before exit.
+    """
+    from harness.storage.db import DBWriter, _SingleWork
+
+    # Use a fresh writer so we can pre-load the queue before starting.
+    w = DBWriter(db_path)
+
+    insert_sql = (
+        "INSERT INTO runs (job_name, solver_name, system_name, returncode, passed, "
+        "runtime_seconds, timestamp, is_baseline, job_batch_uuid) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    # Pre-load queue: 3 items + stop sentinel — all before start().
+    # This guarantees all items and the sentinel are present for a single
+    # _drain_batch call, exercising the mid-drain None path.
+    futures = []
+    for i in range(3):
+        fut = Future()
+        w._queue.put(
+            _SingleWork(
+                sql=insert_sql,
+                params=(f"mid-drain-{i}", "s1", "dev", 0, 1, 1.0,
+                        "2026-01-01T00:00:00+00:00", 0, "b1"),
+                fut=fut,
+            )
+        )
+        futures.append(fut)
+    w._queue.put(None)  # stop sentinel after the 3 items
+
+    # Now start the writer — it will drain all 3 items + sentinel in one call.
+    w.start()
+    w._thread.join(timeout=10)
+
+    # All 3 futures must resolve successfully.
+    for i, fut in enumerate(futures):
+        lastrowid, rowcount = fut.result(timeout=5)
+        assert lastrowid > 0, f"Item {i} was not committed"
+        assert rowcount == 1
+
+    # Verify all rows exist in the database.
+    conn = sqlite3.connect(str(db_path))
+    rows = conn.execute(
+        "SELECT job_name FROM runs WHERE job_name LIKE 'mid-drain-%' ORDER BY job_name"
+    ).fetchall()
+    conn.close()
+    assert [r[0] for r in rows] == [
+        "mid-drain-0", "mid-drain-1", "mid-drain-2"
+    ]
 
 
 def test_stop_with_pending_compound_envelope(db_path):

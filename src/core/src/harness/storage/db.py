@@ -101,18 +101,27 @@ class DBWriter:
                 pass
 
     def _drain_batch(self) -> tuple[list[_WorkItem], bool]:
+        # Block until at least one item arrives.
         item = self._queue.get()
         if item is None:
+            # Stop sentinel was the very first item — nothing to flush.
             return [], True
+
         batch: list[_WorkItem] = [item]
+
+        # Drain any additional items that are already queued (non-blocking).
+        # If the stop sentinel appears mid-drain, return the accumulated batch
+        # with stop=True so _run() flushes all pending work before exiting.
+        # Do NOT discard the batch — that would silently lose writes.
         while True:
             try:
                 nxt = self._queue.get_nowait()
             except queue.Empty:
                 break
             if nxt is None:
-                return batch, True
+                return batch, True  # flush then stop
             batch.append(nxt)
+
         return batch, False
 
     def _execute_batch(self, conn: sqlite3.Connection, batch: list[_WorkItem]) -> None:
