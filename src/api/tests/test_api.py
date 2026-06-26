@@ -6,7 +6,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from harness import RunResult, init_db, db_writer_session, store_run
+from harness import RunResult, init_db, store_run
 
 from basic_restapi.fastapi_app import app
 
@@ -108,23 +108,22 @@ def test_api_delete_runs(tmp_path):
     """DELETE /api/runs removes rows from the configured DB."""
     db = tmp_path / "del.db"
     init_db(db)
-    with db_writer_session(db):
-        rid = store_run(
-            RunResult(
-                job_name="j",
-                solver_name="sv",
-                system_name="sy",
-                returncode=0,
-                stdout="",
-                stderr="",
-                runtime_seconds=0.1,
-                timestamp="2026-01-01T00:00:00+00:00",
-                passed=True,
-                job_batch_uuid="batch-u",
+    with patch("basic_restapi.fastapi_app.DB_PATH", db):
+        with TestClient(app) as tc:
+            rid = store_run(
+                RunResult(
+                    job_name="j",
+                    solver_name="sv",
+                    system_name="sy",
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                    runtime_seconds=0.1,
+                    timestamp="2026-01-01T00:00:00+00:00",
+                    passed=True,
+                    job_batch_uuid="batch-u",
+                )
             )
-        )
-        with patch("basic_restapi.fastapi_app.DB_PATH", db):
-            tc = TestClient(app)
             r = tc.request("DELETE", "/api/runs", json={"ids": [rid, 999001]})
             assert r.status_code == 200
             assert r.json()["deleted"] == 1
@@ -272,23 +271,22 @@ def test_api_invocations_list_get_enriched_and_slurm_404(client):
 def test_api_solver_summaries(tmp_path):
     db = tmp_path / "sum.db"
     init_db(db)
-    with db_writer_session(db):
-        store_run(
-            RunResult(
-                job_name="j",
-                solver_name="s-mon",
-                system_name="sy",
-                returncode=0,
-                stdout="",
-                stderr="",
-                runtime_seconds=1.0,
-                timestamp="2026-01-01T00:00:00+00:00",
-                passed=True,
-                job_batch_uuid="b",
+    with patch("basic_restapi.fastapi_app.DB_PATH", db):
+        with TestClient(app) as tc:
+            store_run(
+                RunResult(
+                    job_name="j",
+                    solver_name="s-mon",
+                    system_name="sy",
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                    runtime_seconds=1.0,
+                    timestamp="2026-01-01T00:00:00+00:00",
+                    passed=True,
+                    job_batch_uuid="b",
+                )
             )
-        )
-        with patch("basic_restapi.fastapi_app.DB_PATH", db):
-            tc = TestClient(app)
             r = tc.get("/api/solver_summaries")
             assert r.status_code == 200
             data = r.json()
@@ -300,9 +298,8 @@ def test_api_matrix_presets_crud(tmp_path):
     """GET/PUT/GET/DELETE /api/matrix_presets persist in DB."""
     db = tmp_path / "matrix_presets.db"
     init_db(db)
-    with db_writer_session(db):
-        with patch("basic_restapi.fastapi_app.DB_PATH", db):
-            tc = TestClient(app)
+    with patch("basic_restapi.fastapi_app.DB_PATH", db):
+        with TestClient(app) as tc:
             assert tc.get("/api/matrix_presets").json() == []
             put = tc.put(
                 "/api/matrix_presets/My-Smoke",
