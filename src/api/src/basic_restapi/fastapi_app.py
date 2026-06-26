@@ -530,10 +530,7 @@ def api_available_metrics(
 
 @app.get("/api/get_job_batch_uuids")
 def api_job_batch_uuids(limit: int = 100):
-    """
-    Gets a list of
-    """
-
+    """Return distinct job batch UUIDs ordered by most recent run in each batch."""
     return get_job_batch_uuids(DB_PATH, limit=limit)
 
 
