@@ -8,6 +8,7 @@ import threading
 from collections.abc import Generator
 from concurrent.futures import Future
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,10 +19,22 @@ from ..runner import RunResult
 
 logger = structlog.get_logger()
 
-# Queue item types for DBWriter
-_SingleItem = tuple[str, tuple, Future]
-_CompoundItem = tuple[list[tuple[str, tuple]], Future]
-_QueueItem = _SingleItem | _CompoundItem | None
+
+@dataclass
+class _SingleWork:
+    sql: str
+    params: tuple
+    fut: Future
+
+
+@dataclass
+class _CompoundWork:
+    statements: list[tuple[str, tuple]]
+    fut: Future
+
+
+_WorkItem = _SingleWork | _CompoundWork
+_QueueItem = _WorkItem | None
 
 
 # ---------------------------------------------------------------------------
@@ -62,13 +75,13 @@ class DBWriter:
 
     def enqueue(self, sql: str, params: tuple = ()) -> Future:
         fut: Future = Future()
-        self._queue.put((sql, params, fut))
+        self._queue.put(_SingleWork(sql=sql, params=params, fut=fut))
         return fut
 
     def enqueue_atomic(self, statements: list[tuple[str, tuple]]) -> Future:
         """Enqueue multiple statements as a single indivisible unit."""
         fut: Future = Future()
-        self._queue.put((statements, fut))
+        self._queue.put(_CompoundWork(statements=statements, fut=fut))
         return fut
 
     def _run(self) -> None:
@@ -87,11 +100,11 @@ class DBWriter:
             except Exception:
                 pass
 
-    def _drain_batch(self) -> tuple[list[_SingleItem | _CompoundItem], bool]:
+    def _drain_batch(self) -> tuple[list[_WorkItem], bool]:
         item = self._queue.get()
         if item is None:
             return [], True
-        batch: list[_SingleItem | _CompoundItem] = [item]
+        batch: list[_WorkItem] = [item]
         while True:
             try:
                 nxt = self._queue.get_nowait()
@@ -103,28 +116,26 @@ class DBWriter:
         return batch, False
 
     def _execute_batch(
-        self, conn: sqlite3.Connection, batch: list[_SingleItem | _CompoundItem]
+        self, conn: sqlite3.Connection, batch: list[_WorkItem]
     ) -> None:
         if not batch:
             return
         pending: list[tuple[Future, tuple[int, int]]] = []
         try:
             conn.execute("BEGIN")
-            for entry in batch:
-                if len(entry) == 3:
-                    sql, params, fut = entry  # type: ignore[misc]
-                    cur = conn.execute(sql, params)
-                    pending.append((fut, (cur.lastrowid or 0, cur.rowcount)))
+            for item in batch:
+                if isinstance(item, _SingleWork):
+                    cur = conn.execute(item.sql, item.params)
+                    pending.append((item.fut, (cur.lastrowid or 0, cur.rowcount)))
                 else:
-                    statements, fut = entry  # type: ignore[misc]
-                    if not statements:
-                        pending.append((fut, (0, 0)))
+                    if not item.statements:
+                        pending.append((item.fut, (0, 0)))
                         continue
                     cur = None
-                    for sql, params in statements:
+                    for sql, params in item.statements:
                         cur = conn.execute(sql, params)
                     pending.append(
-                        (fut, (cur.lastrowid or 0, cur.rowcount))  # type: ignore[union-attr]
+                        (item.fut, (cur.lastrowid or 0, cur.rowcount))  # type: ignore[union-attr] — guarded by non-empty check
                     )
             conn.commit()
         except Exception as exc:
@@ -133,10 +144,9 @@ class DBWriter:
                 conn.rollback()
             except Exception:
                 pass
-            for entry in batch:
-                fut = entry[2] if len(entry) == 3 else entry[1]  # type: ignore[misc]
-                if not fut.done():
-                    fut.set_exception(exc)
+            for item in batch:
+                if not item.fut.done():
+                    item.fut.set_exception(exc)
             return
         for fut, result in pending:
             fut.set_result(result)
