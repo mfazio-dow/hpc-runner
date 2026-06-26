@@ -306,6 +306,15 @@ def test_api_matrix_presets_crud(tmp_path):
         assert tc.delete("/api/matrix_presets/nonesuch").status_code == 404
 
 
-def test_api_resources(client):
+def test_api_resources_returns_list_with_expected_fields(client):
+    """GET /api/resources returns 200 and a list of resource entries with known fields."""
     response = client.get("/api/resources")
     assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+    for item in data:
+        assert "name" in item
+        assert "cpus" in item
+        assert "gpus" in item
+        assert "memory_gb" in item
+        assert "env" in item

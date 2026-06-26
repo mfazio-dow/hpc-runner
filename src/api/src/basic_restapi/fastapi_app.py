@@ -204,7 +204,7 @@ def api_resources():
             "cpus": r.cpus,
             "gpus": r.gpus,
             "memory_gb": r.memory_gb,
-            "env": r.env
+            "env": r.env,
         }
         for r in resources.values()
     ]
