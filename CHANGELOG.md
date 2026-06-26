@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **`GET /api/resources`** — New endpoint listing configured resources (name, cpus, gpus, memory_gb, env). Same discovery pattern as `/api/solvers` and `/api/systems`.
+
+### Fixed
+
+- **Type annotation** on `GET /api/metrics/<solver>/<metric>` history — corrected return type from `list[tuple[str, str]]` to `list[tuple[str, float]]` to match what `get_metrics_history` actually returns.
+
 ## [Released]
 
 ### Documentation

@@ -288,6 +288,7 @@ docker/
 | `/api/health` | GET | Health check (returns `{"status": "ok"}`) |
 | `/api/solvers` | GET | List configured solvers (includes `default_system`) |
 | `/api/systems` | GET | List systems |
+| `/api/resources` | GET | List configured resources (cpus, gpus, memory_gb, env) |
 | `/api/run_solvers` | POST | Run solvers (`solvers`, `batch_name`, `background`; one invocation per solver when background; 202 + `invocations`) |
 | `/api/runs` | GET | List recent runs (?solver=, ?processor=, ?limit=, ?offset=) |
 | `/api/runs` | DELETE | Delete runs (body: `{"ids": [1,2,3]}`) |

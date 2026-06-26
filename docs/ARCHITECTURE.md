@@ -241,6 +241,7 @@ flowchart TB
 | `/api/health` | GET | Health check |
 | `/api/solvers` | GET | List solvers |
 | `/api/systems` | GET | List systems |
+| `/api/resources` | GET | List configured resources (cpus, gpus, memory_gb, env) |
 | `/api/run_solvers` | POST | Run solvers (`solvers`, `session_label` or `batch_name`, `background`). Default **`background: false`**: **200** + results. **`background: true`**: **202** + one **invocation** per requested job |
 | `/api/runs` | GET | List runs (?solver=, ?processor=, ?system=, ?limit=, ?offset=) |
 | `/api/runs` | DELETE | Body `{ "ids": [1,2,3] }` — delete stored runs |
