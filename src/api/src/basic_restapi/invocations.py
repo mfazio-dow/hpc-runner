@@ -26,6 +26,8 @@ logger = structlog.get_logger()
 REGISTRY: dict[str, "InvocationRecord"] = {}
 LOCK = threading.Lock()
 
+_DEFAULT_MAX_BACKGROUND_WORKERS = 32
+
 _executor: ThreadPoolExecutor | None = None
 _executor_lock = threading.Lock()
 
@@ -34,9 +36,15 @@ def _get_executor() -> ThreadPoolExecutor:
     global _executor
     with _executor_lock:
         if _executor is None:
-            _executor = ThreadPoolExecutor(
-                max_workers=32, thread_name_prefix="inv-worker"
+            max_workers = int(
+                os.environ.get(
+                    "HPC_MAX_BACKGROUND_WORKERS", _DEFAULT_MAX_BACKGROUND_WORKERS
+                )
             )
+            _executor = ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix="inv-worker"
+            )
+            logger.info("invocation_executor.started", max_workers=max_workers)
         return _executor
 
 
