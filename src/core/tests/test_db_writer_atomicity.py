@@ -213,8 +213,17 @@ def test_enqueue_atomic_returns_last_statement_result(db_path):
     )
 
     lastrowid, rowcount = fut.result(timeout=5)
-    assert lastrowid == 2
+    assert lastrowid > 0
     assert rowcount == 1
+
+    run = get_run_by_id(db_path, lastrowid)
+    assert run is not None
+    assert run["job_name"] == "second"
+
+    all_runs = get_runs(db_path, solver="s1")
+    job_names = {r["job_name"] for r in all_runs}
+    assert "first" in job_names
+    assert "second" in job_names
 
 
 def test_single_enqueue_still_works(db_path):
@@ -232,7 +241,7 @@ def test_single_enqueue_still_works(db_path):
     )
 
     lastrowid, rowcount = fut.result(timeout=5)
-    assert lastrowid == 1
+    assert lastrowid > 0
     assert rowcount == 1
 
     run = get_run_by_id(db_path, lastrowid)
