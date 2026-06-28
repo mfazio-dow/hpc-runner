@@ -35,6 +35,7 @@ from harness import (
     get_matrix_preset,
     upsert_matrix_preset,
     delete_matrix_preset,
+    decode_run_row,
 )
 
 from . import invocations
@@ -86,34 +87,6 @@ app.add_middleware(
 )
 
 
-def _normalize_run_row(r: dict) -> None:
-    """Decode JSON-ish columns for API responses (mutates dict in place)."""
-    if r.get("metrics_json"):
-        try:
-            r["metrics"] = json.loads(r["metrics_json"])
-        except Exception:
-            r["metrics"] = {}
-    else:
-        r["metrics"] = {}
-    if r.get("validation_errors") is not None:
-        try:
-            r["validation_errors"] = json.loads(r["validation_errors"])
-        except Exception:
-            r["validation_errors"] = []
-    else:
-        r["validation_errors"] = []
-    r["passed"] = bool(r.get("passed"))
-    r["is_baseline"] = bool(r.get("is_baseline", False))
-    sj = r.get("scheduler_job_ids")
-    if isinstance(sj, str):
-        try:
-            r["scheduler_job_ids"] = json.loads(sj or "[]")
-        except Exception:
-            r["scheduler_job_ids"] = []
-    elif sj is None:
-        r["scheduler_job_ids"] = []
-    r["scheduler_backend"] = r.get("scheduler_backend") or ""
-    r["submit_container"] = r.get("submit_container") or ""
 
 
 def _load_definitions():
@@ -319,9 +292,7 @@ def api_runs(
         limit=limit,
         offset=offset,
     )
-    for r in runs:
-        _normalize_run_row(r)
-    return runs
+    return [decode_run_row(r) for r in runs]
 
 
 @app.delete("/api/runs")
@@ -385,9 +356,7 @@ def api_run_detail(run_id: int):
     run = get_run_by_id(DB_PATH, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    run = dict(run)
-    _normalize_run_row(run)
-    return run
+    return decode_run_row(dict(run))
 
 
 @app.get("/api/runs/{run_id}/slurm_status")

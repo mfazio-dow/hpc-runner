@@ -383,7 +383,7 @@ def set_baseline_run(run_id: int) -> dict[str, Any] | None:
     db_path = _get_writer_db_path()
     with _connect_readonly(db_path) as conn:
         updated = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-    return _run_to_response(dict(updated)) if updated else None
+    return decode_run_row(dict(updated)) if updated else None
 
 
 def upsert_matrix_preset(label: str, cells: list[dict[str, Any]]) -> None:
@@ -550,8 +550,8 @@ def get_metrics_history(
     return result
 
 
-def _run_to_response(r: dict[str, Any]) -> dict[str, Any]:
-    """Decode metrics_json and validation_errors for a run row."""
+def decode_run_row(r: dict[str, Any]) -> dict[str, Any]:
+    """Decode JSON columns in a raw SQLite runs row into a response-ready dict."""
     out = dict(r)
     if out.get("metrics_json"):
         try:
@@ -569,6 +569,16 @@ def _run_to_response(r: dict[str, Any]) -> dict[str, Any]:
         out["validation_errors"] = []
     out["passed"] = bool(out.get("passed"))
     out["is_baseline"] = bool(out.get("is_baseline", False))
+    sj = out.get("scheduler_job_ids")
+    if isinstance(sj, str):
+        try:
+            out["scheduler_job_ids"] = json.loads(sj or "[]")
+        except json.JSONDecodeError:
+            out["scheduler_job_ids"] = []
+    elif sj is None:
+        out["scheduler_job_ids"] = []
+    out["scheduler_backend"] = out.get("scheduler_backend") or ""
+    out["submit_container"] = out.get("submit_container") or ""
     return out
 
 
@@ -583,7 +593,7 @@ def get_baseline_run(db_path: str | Path, solver_name: str) -> dict[str, Any] | 
         ).fetchone()
     if row is None:
         return None
-    return _run_to_response(dict(row))
+    return decode_run_row(dict(row))
 
 
 def get_baseline_comparison(
@@ -627,7 +637,7 @@ def get_baseline_comparison(
         comparisons: list[dict[str, Any]] = []
         other_runs_decoded: list[dict[str, Any]] = []
         for row in others:
-            r = _run_to_response(dict(row))
+            r = decode_run_row(dict(row))
             other_runs_decoded.append(r)
             vs: dict[str, dict[str, Any]] = {}
             for k, base_val in baseline_metrics.items():

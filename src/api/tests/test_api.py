@@ -104,6 +104,37 @@ def test_api_job_batch_uuids_returns_list(client):
     assert isinstance(data, list)
 
 
+def test_api_set_baseline_returns_scheduler_fields(tmp_path):
+    """POST /api/runs/{run_id}/set_baseline response includes scheduler fields."""
+    db = tmp_path / "sched.db"
+    init_db(db)
+    with patch("basic_restapi.fastapi_app.DB_PATH", db):
+        with TestClient(app) as tc:
+            rid = store_run(
+                RunResult(
+                    job_name="j",
+                    solver_name="sv",
+                    system_name="sys",
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                    runtime_seconds=1.0,
+                    timestamp="2026-01-01T00:00:00+00:00",
+                    passed=True,
+                    job_batch_uuid="batch-1",
+                    scheduler_backend="slurm",
+                    scheduler_job_ids=["12345", "12346"],
+                    submit_container="sif-image.sif",
+                )
+            )
+            r = tc.post(f"/api/runs/{rid}/set_baseline")
+            assert r.status_code == 200
+            data = r.json()
+            assert data["scheduler_backend"] == "slurm"
+            assert data["scheduler_job_ids"] == ["12345", "12346"]
+            assert data["submit_container"] == "sif-image.sif"
+
+
 def test_api_delete_runs(tmp_path):
     """DELETE /api/runs removes rows from the configured DB."""
     db = tmp_path / "del.db"

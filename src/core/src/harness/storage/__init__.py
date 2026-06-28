@@ -19,6 +19,7 @@ from .db import (
     get_matrix_preset,
     upsert_matrix_preset,
     delete_matrix_preset,
+    decode_run_row,
 )
 
 __all__ = [
@@ -41,4 +42,5 @@ __all__ = [
     "get_matrix_preset",
     "upsert_matrix_preset",
     "delete_matrix_preset",
+    "decode_run_row",
 ]
