@@ -1,12 +1,13 @@
 # tests/test_api.py - API error handling and responses
 
+import sqlite3
 from unittest.mock import patch
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from harness import RunResult, init_db, store_run
+from harness import RunResult, store_run
 
 from basic_restapi.fastapi_app import app
 
@@ -104,61 +105,55 @@ def test_api_job_batch_uuids_returns_list(client):
     assert isinstance(data, list)
 
 
-def test_api_set_baseline_returns_scheduler_fields(tmp_path):
+def test_api_set_baseline_returns_scheduler_fields(api_client):
     """POST /api/runs/{run_id}/set_baseline response includes scheduler fields."""
-    db = tmp_path / "sched.db"
-    init_db(db)
-    with patch("basic_restapi.fastapi_app.DB_PATH", db):
-        with TestClient(app) as tc:
-            rid = store_run(
-                RunResult(
-                    job_name="j",
-                    solver_name="sv",
-                    system_name="sys",
-                    returncode=0,
-                    stdout="",
-                    stderr="",
-                    runtime_seconds=1.0,
-                    timestamp="2026-01-01T00:00:00+00:00",
-                    passed=True,
-                    job_batch_uuid="batch-1",
-                    scheduler_backend="slurm",
-                    scheduler_job_ids=["12345", "12346"],
-                    submit_container="sif-image.sif",
-                )
-            )
-            r = tc.post(f"/api/runs/{rid}/set_baseline")
-            assert r.status_code == 200
-            data = r.json()
-            assert data["scheduler_backend"] == "slurm"
-            assert data["scheduler_job_ids"] == ["12345", "12346"]
-            assert data["submit_container"] == "sif-image.sif"
+    tc, _db = api_client
+    rid = store_run(
+        RunResult(
+            job_name="j",
+            solver_name="sv",
+            system_name="sys",
+            returncode=0,
+            stdout="",
+            stderr="",
+            runtime_seconds=1.0,
+            timestamp="2026-01-01T00:00:00+00:00",
+            passed=True,
+            job_batch_uuid="batch-1",
+            scheduler_backend="slurm",
+            scheduler_job_ids=["12345", "12346"],
+            submit_container="sif-image.sif",
+        )
+    )
+    r = tc.post(f"/api/runs/{rid}/set_baseline")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["scheduler_backend"] == "slurm"
+    assert data["scheduler_job_ids"] == ["12345", "12346"]
+    assert data["submit_container"] == "sif-image.sif"
 
 
-def test_api_delete_runs(tmp_path):
+def test_api_delete_runs(api_client):
     """DELETE /api/runs removes rows from the configured DB."""
-    db = tmp_path / "del.db"
-    init_db(db)
-    with patch("basic_restapi.fastapi_app.DB_PATH", db):
-        with TestClient(app) as tc:
-            rid = store_run(
-                RunResult(
-                    job_name="j",
-                    solver_name="sv",
-                    system_name="sy",
-                    returncode=0,
-                    stdout="",
-                    stderr="",
-                    runtime_seconds=0.1,
-                    timestamp="2026-01-01T00:00:00+00:00",
-                    passed=True,
-                    job_batch_uuid="batch-u",
-                )
-            )
-            r = tc.request("DELETE", "/api/runs", json={"ids": [rid, 999001]})
-            assert r.status_code == 200
-            assert r.json()["deleted"] == 1
-            assert tc.get(f"/api/runs/{rid}").status_code == 404
+    tc, _db = api_client
+    rid = store_run(
+        RunResult(
+            job_name="j",
+            solver_name="sv",
+            system_name="sy",
+            returncode=0,
+            stdout="",
+            stderr="",
+            runtime_seconds=0.1,
+            timestamp="2026-01-01T00:00:00+00:00",
+            passed=True,
+            job_batch_uuid="batch-u",
+        )
+    )
+    r = tc.request("DELETE", "/api/runs", json={"ids": [rid, 999001]})
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 1
+    assert tc.get(f"/api/runs/{rid}").status_code == 404
 
 
 def test_api_delete_runs_empty_ids_returns_422(client):
@@ -299,52 +294,72 @@ def test_api_invocations_list_get_enriched_and_slurm_404(client):
         invocations.REGISTRY.clear()
 
 
-def test_api_solver_summaries(tmp_path):
-    db = tmp_path / "sum.db"
-    init_db(db)
-    with patch("basic_restapi.fastapi_app.DB_PATH", db):
-        with TestClient(app) as tc:
-            store_run(
-                RunResult(
-                    job_name="j",
-                    solver_name="s-mon",
-                    system_name="sy",
-                    returncode=0,
-                    stdout="",
-                    stderr="",
-                    runtime_seconds=1.0,
-                    timestamp="2026-01-01T00:00:00+00:00",
-                    passed=True,
-                    job_batch_uuid="b",
-                )
-            )
-            r = tc.get("/api/solver_summaries")
-            assert r.status_code == 200
-            data = r.json()
-            assert isinstance(data, list)
-            assert any(x.get("solver_name") == "s-mon" for x in data)
+def test_api_solver_summaries(api_client):
+    tc, _db = api_client
+    store_run(
+        RunResult(
+            job_name="j",
+            solver_name="s-mon",
+            system_name="sy",
+            returncode=0,
+            stdout="",
+            stderr="",
+            runtime_seconds=1.0,
+            timestamp="2026-01-01T00:00:00+00:00",
+            passed=True,
+            job_batch_uuid="b",
+        )
+    )
+    r = tc.get("/api/solver_summaries")
+    assert r.status_code == 200
+    data = r.json()
+    assert isinstance(data, list)
+    assert any(x.get("solver_name") == "s-mon" for x in data)
 
 
-def test_api_matrix_presets_crud(tmp_path):
+def test_api_matrix_presets_crud(api_client):
     """GET/PUT/GET/DELETE /api/matrix_presets persist in DB."""
-    db = tmp_path / "matrix_presets.db"
-    init_db(db)
-    with patch("basic_restapi.fastapi_app.DB_PATH", db):
-        with TestClient(app) as tc:
-            assert tc.get("/api/matrix_presets").json() == []
-            put = tc.put(
-                "/api/matrix_presets/My-Smoke",
-                json={"cells": [{"name": "sol-a", "system": "sys-1"}]},
-            )
-            assert put.status_code == 200
-            data = put.json()
-            assert data["label"] == "my-smoke"
-            assert data["cells"] == [{"name": "sol-a", "system": "sys-1"}]
-            listed = tc.get("/api/matrix_presets").json()
-            assert len(listed) == 1
-            assert listed[0]["label"] == "my-smoke"
-            one = tc.get("/api/matrix_presets/My-Smoke").json()
-            assert one["cells"] == [{"name": "sol-a", "system": "sys-1"}]
-            assert tc.delete("/api/matrix_presets/my-smoke").status_code == 200
-            assert tc.get("/api/matrix_presets/my-smoke").status_code == 404
-            assert tc.delete("/api/matrix_presets/nonesuch").status_code == 404
+    tc, _db = api_client
+    assert tc.get("/api/matrix_presets").json() == []
+    put = tc.put(
+        "/api/matrix_presets/My-Smoke",
+        json={"cells": [{"name": "sol-a", "system": "sys-1"}]},
+    )
+    assert put.status_code == 200
+    data = put.json()
+    assert data["label"] == "my-smoke"
+    assert data["cells"] == [{"name": "sol-a", "system": "sys-1"}]
+    listed = tc.get("/api/matrix_presets").json()
+    assert len(listed) == 1
+    assert listed[0]["label"] == "my-smoke"
+    one = tc.get("/api/matrix_presets/My-Smoke").json()
+    assert one["cells"] == [{"name": "sol-a", "system": "sys-1"}]
+    assert tc.delete("/api/matrix_presets/my-smoke").status_code == 200
+    assert tc.get("/api/matrix_presets/my-smoke").status_code == 404
+    assert tc.delete("/api/matrix_presets/nonesuch").status_code == 404
+
+
+def test_store_run_writes_to_test_db_not_production(api_client):
+    """Regression: store_run must write to the api_client fixture's DB."""
+    _tc, db = api_client
+    store_run(
+        RunResult(
+            job_name="iso-job",
+            solver_name="iso-solver",
+            system_name="iso-sys",
+            returncode=0,
+            stdout="",
+            stderr="",
+            runtime_seconds=0.5,
+            timestamp="2026-01-01T00:00:00+00:00",
+            passed=True,
+            job_batch_uuid="iso-batch",
+        )
+    )
+    conn = sqlite3.connect(str(db))
+    count = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    conn.close()
+    assert count == 1, (
+        f"Expected 1 row in test DB but found {count}; "
+        "store_run likely wrote to the production DB instead"
+    )
