@@ -525,6 +525,29 @@ def test_start_writer_raises_on_different_path(tmp_path):
             start_writer(db_b)
 
 
+def test_connect_readonly_rejects_writes(tmp_path):
+    """_connect_readonly opens the database in read-only mode; writes raise OperationalError."""
+    import sqlite3 as _sqlite3
+
+    from harness.storage.db import _connect_readonly
+
+    stop_writer()  # clear autouse fixture's writer
+    db_path = tmp_path / "ro.db"
+    init_db(db_path)
+
+    with _connect_readonly(db_path) as conn:
+        # Reads must still work
+        rows = conn.execute("SELECT * FROM runs").fetchall()
+        assert rows == []
+
+        # Any write must be rejected at the SQLite level
+        with pytest.raises(_sqlite3.OperationalError, match="readonly"):
+            conn.execute("INSERT INTO runs (job_name, solver_name, system_name, "
+                         "returncode, passed, runtime_seconds, timestamp, "
+                         "job_batch_uuid) VALUES (?,?,?,?,?,?,?,?)",
+                         ("j", "s", "sys", 0, 1, 1.0, "2026-01-01", "uuid"))
+
+
 def test_init_db_enables_wal_mode(tmp_path):
     """init_db sets journal_mode=WAL before any DDL runs."""
     import sqlite3 as _sqlite3

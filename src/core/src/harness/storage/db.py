@@ -43,7 +43,8 @@ _QueueItem = _WorkItem | None
 
 
 def _connect_readonly(path: str | Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path), timeout=30)
+    uri = f"file:{Path(path).resolve()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
