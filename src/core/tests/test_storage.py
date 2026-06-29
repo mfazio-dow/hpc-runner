@@ -179,6 +179,15 @@ def test_get_job_batch_uuids_orders_by_max_timestamp(tmp_path):
     assert uuids == ["batch-a", "batch-b"]
 
 
+def test_get_job_batch_uuids_returns_empty_list_when_no_runs(tmp_path):
+    """get_job_batch_uuids returns [] not None when there are no runs."""
+    db_path = tmp_path / "empty.db"
+    init_db(db_path)
+    result = get_job_batch_uuids(db_path)
+    assert result == []
+    assert result is not None
+
+
 def test_get_run_by_id(tmp_path):
     """Retrieve single run by id."""
     db_path = tmp_path / "test.db"

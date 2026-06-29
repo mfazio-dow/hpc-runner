@@ -676,7 +676,7 @@ def get_baseline_comparison(
     return result
 
 
-def get_job_batch_uuids(db_path: str | Path, limit: int = 100) -> list[Any] | None:
+def get_job_batch_uuids(db_path: str | Path, limit: int = 100) -> list[str]:
     """Return job_batch_uuid values ordered by most recent run in each batch."""
     lim = int(limit)
     with _connect_readonly(db_path) as conn:
@@ -691,8 +691,6 @@ def get_job_batch_uuids(db_path: str | Path, limit: int = 100) -> list[Any] | No
             """,
             (lim,),
         ).fetchall()
-    if rows is None:
-        return None
     return [row["job_batch_uuid"] for row in rows]
 
 
