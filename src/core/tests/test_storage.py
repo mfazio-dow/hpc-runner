@@ -489,16 +489,16 @@ def test_get_baseline_comparison_multi_solver(tmp_path):
 
 
 def test_db_writer_session_starts_and_stops_writer(tmp_path):
-    """db_writer_session starts the writer on entry and stops on exit."""
+    """db_writer_session starts the writer on entry and stops it on exit;
+    write functions raise after the session closes."""
     stop_writer()  # clear autouse fixture's writer
     db_path = tmp_path / "cm.db"
     init_db(db_path)
     with db_writer_session(db_path):
         row_id = store_run(_make_result())
         assert row_id > 0
-    from harness.storage.db import _writer
-
-    assert _writer is None
+    with pytest.raises(RuntimeError, match="DBWriter not started"):
+        store_run(_make_result())
 
 
 def test_db_writer_session_stops_writer_on_exception(tmp_path):
@@ -509,9 +509,8 @@ def test_db_writer_session_stops_writer_on_exception(tmp_path):
     with pytest.raises(ValueError, match="boom"):
         with db_writer_session(db_path):
             raise ValueError("boom")
-    from harness.storage.db import _writer
-
-    assert _writer is None
+    with pytest.raises(RuntimeError, match="DBWriter not started"):
+        store_run(_make_result())
 
 
 def test_start_writer_raises_on_different_path(tmp_path):
