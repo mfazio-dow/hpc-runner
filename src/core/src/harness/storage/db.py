@@ -612,67 +612,76 @@ def get_baseline_comparison(
             solvers_rows = conn.execute(
                 "SELECT DISTINCT solver_name FROM runs"
             ).fetchall()
-    solvers_list = [r[0] for r in solvers_rows]
-    result: list[dict[str, Any]] = []
-    for sname in solvers_list:
-        baseline = get_baseline_run(db_path, sname)
-        if not baseline:
-            result.append(
-                {
-                    "solver_name": sname,
-                    "baseline_run": None,
-                    "other_runs": [],
-                    "comparisons": [],
-                }
-            )
-            continue
-        baseline_metrics = baseline.get("metrics") or {}
-        with _connect_readonly(db_path) as conn:
+
+        result: list[dict[str, Any]] = []
+        for sname in (r[0] for r in solvers_rows):
+            baseline_row = conn.execute(
+                """SELECT * FROM runs
+                   WHERE solver_name = ? AND is_baseline = 1
+                   ORDER BY timestamp DESC LIMIT 1""",
+                (sname,),
+            ).fetchone()
+
+            if not baseline_row:
+                result.append(
+                    {
+                        "solver_name": sname,
+                        "baseline_run": None,
+                        "other_runs": [],
+                        "comparisons": [],
+                    }
+                )
+                continue
+
+            baseline = decode_run_row(dict(baseline_row))
+            baseline_metrics = baseline.get("metrics") or {}
+
             others = conn.execute(
                 """SELECT * FROM runs
                    WHERE solver_name = ? AND (is_baseline = 0 OR id != ?)
                    ORDER BY timestamp DESC LIMIT ?""",
                 (sname, baseline["id"], limit_per_solver),
             ).fetchall()
-        comparisons: list[dict[str, Any]] = []
-        other_runs_decoded: list[dict[str, Any]] = []
-        for row in others:
-            r = decode_run_row(dict(row))
-            other_runs_decoded.append(r)
-            vs: dict[str, dict[str, Any]] = {}
-            for k, base_val in baseline_metrics.items():
-                if not isinstance(base_val, (int, float)):
-                    continue
-                val = r["metrics"].get(k)
-                if val is None or not isinstance(val, (int, float)):
-                    continue
-                base_f = float(base_val)
-                val_f = float(val)
-                delta = val_f - base_f
-                delta_pct = (100.0 * delta / base_f) if base_f != 0 else None
-                vs[k] = {
-                    "baseline": base_f,
-                    "value": val_f,
-                    "delta": delta,
-                    "delta_pct": delta_pct,
-                }
-            comparisons.append(
+
+            comparisons: list[dict[str, Any]] = []
+            other_runs_decoded: list[dict[str, Any]] = []
+            for row in others:
+                r = decode_run_row(dict(row))
+                other_runs_decoded.append(r)
+                vs: dict[str, dict[str, Any]] = {}
+                for k, base_val in baseline_metrics.items():
+                    if not isinstance(base_val, (int, float)):
+                        continue
+                    val = r["metrics"].get(k)
+                    if val is None or not isinstance(val, (int, float)):
+                        continue
+                    base_f = float(base_val)
+                    val_f = float(val)
+                    delta = val_f - base_f
+                    delta_pct = (100.0 * delta / base_f) if base_f != 0 else None
+                    vs[k] = {
+                        "baseline": base_f,
+                        "value": val_f,
+                        "delta": delta,
+                        "delta_pct": delta_pct,
+                    }
+                comparisons.append(
+                    {
+                        "run_id": r["id"],
+                        "job_name": r["job_name"],
+                        "timestamp": r["timestamp"],
+                        "metrics": r["metrics"],
+                        "vs_baseline": vs,
+                    }
+                )
+            result.append(
                 {
-                    "run_id": r["id"],
-                    "job_name": r["job_name"],
-                    "timestamp": r["timestamp"],
-                    "metrics": r["metrics"],
-                    "vs_baseline": vs,
+                    "solver_name": sname,
+                    "baseline_run": baseline,
+                    "other_runs": other_runs_decoded,
+                    "comparisons": comparisons,
                 }
             )
-        result.append(
-            {
-                "solver_name": sname,
-                "baseline_run": baseline,
-                "other_runs": other_runs_decoded,
-                "comparisons": comparisons,
-            }
-        )
     return result
 
 

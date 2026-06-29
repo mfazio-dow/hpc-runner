@@ -402,6 +402,89 @@ def test_get_baseline_comparison_solver_without_baseline(tmp_path):
     assert comparison[0]["comparisons"] == []
 
 
+def test_get_baseline_comparison_multi_solver(tmp_path):
+    """All solvers returned with correct shape when no solver_name filter given."""
+    db_path = tmp_path / "test.db"
+
+    # Solver A: has baseline + 1 other run
+    store_run(
+        _make_result(
+            job_name="a_base",
+            solver_name="solverA",
+            metrics={"mlups": 100.0},
+            baseline=True,
+        )
+    )
+    store_run(
+        _make_result(
+            job_name="a_other",
+            solver_name="solverA",
+            metrics={"mlups": 120.0},
+            baseline=False,
+        )
+    )
+
+    # Solver B: has baseline + 2 other runs
+    store_run(
+        _make_result(
+            job_name="b_base",
+            solver_name="solverB",
+            metrics={"runtime_seconds": 5.0},
+            baseline=True,
+        )
+    )
+    store_run(
+        _make_result(
+            job_name="b_other1",
+            solver_name="solverB",
+            metrics={"runtime_seconds": 6.0},
+            baseline=False,
+        )
+    )
+    store_run(
+        _make_result(
+            job_name="b_other2",
+            solver_name="solverB",
+            metrics={"runtime_seconds": 4.5},
+            baseline=False,
+        )
+    )
+
+    # Solver C: no baseline
+    store_run(
+        _make_result(
+            job_name="c_run",
+            solver_name="solverC",
+            metrics={"mlups": 50.0},
+            baseline=False,
+        )
+    )
+
+    result = get_baseline_comparison(db_path)
+    assert len(result) == 3
+
+    by_solver = {entry["solver_name"]: entry for entry in result}
+
+    # Solver A
+    a = by_solver["solverA"]
+    assert a["baseline_run"] is not None
+    assert a["baseline_run"]["job_name"] == "a_base"
+    assert len(a["comparisons"]) == 1
+    assert a["comparisons"][0]["vs_baseline"]["mlups"]["delta"] == pytest.approx(20.0)
+
+    # Solver B
+    b = by_solver["solverB"]
+    assert b["baseline_run"] is not None
+    assert b["baseline_run"]["job_name"] == "b_base"
+    assert len(b["comparisons"]) == 2
+
+    # Solver C — no baseline
+    c = by_solver["solverC"]
+    assert c["baseline_run"] is None
+    assert c["comparisons"] == []
+    assert c["other_runs"] == []
+
+
 # --- db_writer_session context manager tests ---
 
 
