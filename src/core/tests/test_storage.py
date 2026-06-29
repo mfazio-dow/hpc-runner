@@ -523,3 +523,15 @@ def test_start_writer_raises_on_different_path(tmp_path):
     with db_writer_session(db_a):
         with pytest.raises(RuntimeError, match="already active"):
             start_writer(db_b)
+
+
+def test_init_db_enables_wal_mode(tmp_path):
+    """init_db sets journal_mode=WAL before any DDL runs."""
+    import sqlite3 as _sqlite3
+
+    stop_writer()  # clear autouse fixture's writer
+    db_path = tmp_path / "wal.db"
+    init_db(db_path)
+    with _sqlite3.connect(str(db_path)) as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode == "wal"

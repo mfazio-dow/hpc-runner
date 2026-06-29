@@ -232,6 +232,8 @@ def init_db(path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path, timeout=30) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS runs (
@@ -287,8 +289,6 @@ def init_db(path: str | Path) -> None:
         if "submit_container" not in columns:
             conn.execute("ALTER TABLE runs ADD COLUMN submit_container TEXT")
         conn.commit()
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
 
 
 # ---------------------------------------------------------------------------
