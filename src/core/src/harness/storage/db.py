@@ -104,22 +104,23 @@ class DBWriter:
         # Block until at least one item arrives.
         item = self._queue.get()
         if item is None:
-            # Stop sentinel was the very first item — nothing to flush.
+            # Sentinel arrived before any work was queued in this cycle.
+            # Returning an empty batch is intentional and safe — there is nothing to flush.
             return [], True
 
         batch: list[_WorkItem] = [item]
 
         # Drain any additional items that are already queued (non-blocking).
-        # If the stop sentinel appears mid-drain, return the accumulated batch
+        # If the stop sentinel arrives mid-drain we MUST return the accumulated batch
         # with stop=True so _run() flushes all pending work before exiting.
-        # Do NOT discard the batch — that would silently lose writes.
+        # Discarding batch here would silently lose writes — do not do it.
         while True:
             try:
                 nxt = self._queue.get_nowait()
             except queue.Empty:
                 break
             if nxt is None:
-                return batch, True  # flush then stop
+                return batch, True  # flush accumulated work, then stop
             batch.append(nxt)
 
         return batch, False
