@@ -53,8 +53,8 @@ async def lifespan(app: FastAPI):
     start_writer(str(DB_PATH))
     logger.info("startup", db_path=str(DB_PATH), writer="started")
     yield
-    stop_writer()
     invocations.shutdown_executor()
+    stop_writer()
     logger.info("shutdown", writer="stopped", executor="stopped")
 
 
