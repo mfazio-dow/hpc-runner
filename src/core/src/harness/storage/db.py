@@ -60,6 +60,7 @@ class DBWriter:
         self._queue: queue.Queue[_QueueItem] = queue.Queue()
         self._thread = threading.Thread(target=self._run, daemon=True, name="db-writer")
         self._started = False
+        self._stopped = threading.Event()
 
     def start(self) -> None:
         if self._started:
@@ -70,6 +71,7 @@ class DBWriter:
     def stop(self) -> None:
         if not self._started:
             return
+        self._stopped.set()
         self._queue.put(None)
         self._thread.join(timeout=30)
         if self._thread.is_alive():
@@ -81,12 +83,22 @@ class DBWriter:
 
     def enqueue(self, sql: str, params: tuple = ()) -> Future:
         fut: Future = Future()
+        if self._stopped.is_set():
+            fut.set_exception(
+                RuntimeError("DBWriter is stopped — cannot accept new work")
+            )
+            return fut
         self._queue.put(_SingleWork(sql=sql, params=params, fut=fut))
         return fut
 
     def enqueue_atomic(self, statements: list[tuple[str, tuple]]) -> Future:
         """Enqueue multiple statements as a single indivisible unit."""
         fut: Future = Future()
+        if self._stopped.is_set():
+            fut.set_exception(
+                RuntimeError("DBWriter is stopped — cannot accept new work")
+            )
+            return fut
         self._queue.put(_CompoundWork(statements=statements, fut=fut))
         return fut
 
@@ -149,9 +161,7 @@ class DBWriter:
                     for sql, params in item.statements:
                         cur = conn.execute(sql, params)
                     assert cur is not None
-                    pending.append(
-                        (item.fut, (cur.lastrowid or 0, cur.rowcount))
-                    )
+                    pending.append((item.fut, (cur.lastrowid or 0, cur.rowcount)))
             conn.commit()
         except Exception as exc:
             logger.error("db_writer.batch_error", error=str(exc))

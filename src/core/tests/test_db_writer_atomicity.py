@@ -598,3 +598,54 @@ def test_stop_with_pending_compound_envelope(db_path):
     conn.close()
     assert row is not None
     assert row[0] == "before-stop"
+
+
+def test_enqueue_after_stop_raises(db_path):
+    """enqueue() on a stopped DBWriter must raise immediately, not hang."""
+    from harness.storage.db import DBWriter
+
+    w = DBWriter(db_path)
+    w.start()
+    w.stop()
+
+    fut = w.enqueue("SELECT 1")
+    with pytest.raises(RuntimeError, match="stopped"):
+        fut.result(timeout=1)
+
+
+def test_enqueue_atomic_after_stop_raises(db_path):
+    """enqueue_atomic() on a stopped DBWriter must raise immediately, not hang."""
+    from harness.storage.db import DBWriter
+
+    w = DBWriter(db_path)
+    w.start()
+    w.stop()
+
+    fut = w.enqueue_atomic([("SELECT 1", ())])
+    with pytest.raises(RuntimeError, match="stopped"):
+        fut.result(timeout=1)
+
+
+def test_enqueue_race_with_concurrent_stop(db_path):
+    """Thread obtains writer reference, then stop() runs, then enqueue() — must not hang."""
+    from harness.storage.db import DBWriter
+
+    w = DBWriter(db_path)
+    w.start()
+
+    # Simulate the race: grab a reference, then stop from another thread
+    stop_done = threading.Event()
+
+    def _stop_writer():
+        w.stop()
+        stop_done.set()
+
+    t = threading.Thread(target=_stop_writer)
+    t.start()
+    stop_done.wait(timeout=5)
+    t.join(timeout=5)
+
+    # Now enqueue on the stopped writer — must fail fast
+    fut = w.enqueue("SELECT 1")
+    with pytest.raises(RuntimeError, match="stopped"):
+        fut.result(timeout=1)
