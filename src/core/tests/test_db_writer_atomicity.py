@@ -8,13 +8,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import pytest
 from harness import RunResult
 from harness.storage import (
+    db_writer_session,
     delete_runs,
     get_run_by_id,
     get_runs,
     init_db,
     set_baseline_run,
-    start_writer,
-    stop_writer,
     store_run,
 )
 
@@ -28,9 +27,8 @@ def db_path(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _writer(db_path):
-    start_writer(db_path)
-    yield
-    stop_writer()
+    with db_writer_session(db_path):
+        yield
 
 
 def _make_result(
@@ -550,6 +548,7 @@ def test_stop_resets_started_on_clean_exit(db_path):
 
 def test_stop_with_pending_compound_envelope(db_path):
     """Compound envelopes enqueued before stop() execute before shutdown."""
+    from harness.storage import stop_writer
     from harness.storage.db import _writer
 
     assert _writer is not None
