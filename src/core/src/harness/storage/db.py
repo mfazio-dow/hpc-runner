@@ -148,8 +148,9 @@ class DBWriter:
                     cur = None
                     for sql, params in item.statements:
                         cur = conn.execute(sql, params)
+                    assert cur is not None
                     pending.append(
-                        (item.fut, (cur.lastrowid or 0, cur.rowcount))  # type: ignore[union-attr] — guarded by non-empty check
+                        (item.fut, (cur.lastrowid or 0, cur.rowcount))
                     )
             conn.commit()
         except Exception as exc:
