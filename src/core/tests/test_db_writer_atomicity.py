@@ -488,8 +488,17 @@ def test_drain_batch_mid_drain_sentinel_flushes_pending(db_path):
         w._queue.put(
             _SingleWork(
                 sql=insert_sql,
-                params=(f"mid-drain-{i}", "s1", "dev", 0, 1, 1.0,
-                        "2026-01-01T00:00:00+00:00", 0, "b1"),
+                params=(
+                    f"mid-drain-{i}",
+                    "s1",
+                    "dev",
+                    0,
+                    1,
+                    1.0,
+                    "2026-01-01T00:00:00+00:00",
+                    0,
+                    "b1",
+                ),
                 fut=fut,
             )
         )
@@ -512,9 +521,7 @@ def test_drain_batch_mid_drain_sentinel_flushes_pending(db_path):
         "SELECT job_name FROM runs WHERE job_name LIKE 'mid-drain-%' ORDER BY job_name"
     ).fetchall()
     conn.close()
-    assert [r[0] for r in rows] == [
-        "mid-drain-0", "mid-drain-1", "mid-drain-2"
-    ]
+    assert [r[0] for r in rows] == ["mid-drain-0", "mid-drain-1", "mid-drain-2"]
 
 
 def test_stop_raises_on_timeout(db_path):

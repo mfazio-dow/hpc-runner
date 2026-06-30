@@ -542,10 +542,12 @@ def test_connect_readonly_rejects_writes(tmp_path):
 
         # Any write must be rejected at the SQLite level
         with pytest.raises(_sqlite3.OperationalError, match="readonly"):
-            conn.execute("INSERT INTO runs (job_name, solver_name, system_name, "
-                         "returncode, passed, runtime_seconds, timestamp, "
-                         "job_batch_uuid) VALUES (?,?,?,?,?,?,?,?)",
-                         ("j", "s", "sys", 0, 1, 1.0, "2026-01-01", "uuid"))
+            conn.execute(
+                "INSERT INTO runs (job_name, solver_name, system_name, "
+                "returncode, passed, runtime_seconds, timestamp, "
+                "job_batch_uuid) VALUES (?,?,?,?,?,?,?,?)",
+                ("j", "s", "sys", 0, 1, 1.0, "2026-01-01", "uuid"),
+            )
 
 
 def test_init_db_enables_wal_mode(tmp_path):

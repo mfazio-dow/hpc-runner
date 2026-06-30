@@ -87,8 +87,6 @@ app.add_middleware(
 )
 
 
-
-
 def _load_definitions():
     return load_all(CONFIG_DIR, None)
 
