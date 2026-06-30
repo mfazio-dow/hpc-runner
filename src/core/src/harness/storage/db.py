@@ -381,7 +381,12 @@ def delete_runs(run_ids: list[int]) -> int:
 
 
 def set_baseline_run(run_id: int) -> dict[str, Any] | None:
-    """Set a specific run as the baseline for its solver."""
+    """Set a specific run as the baseline for its solver.
+
+    Returns the updated run dict, or None if run_id was not found or was
+    deleted concurrently (either before the write or between write and
+    read-back).
+    """
     stmts: list[tuple[str, tuple]] = [
         (
             """UPDATE runs SET is_baseline = 0

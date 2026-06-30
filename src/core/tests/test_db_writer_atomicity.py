@@ -386,18 +386,12 @@ def test_batch_rollback_rejects_all_futures_including_earlier_items(db_path):
 
 
 def test_set_baseline_run_after_delete_no_stale_read(db_path, monkeypatch):
-    """set_baseline_run must not use a stale read when the run is deleted concurrently.
+    """set_baseline_run returns None when the target row is deleted before the write executes.
 
-    Regression test for TOCTOU race: the old implementation read the solver_name
-    outside the writer queue, then enqueued the write separately. If a delete
-    landed between those two operations, the UPDATE silently matched zero rows
-    and the old baseline was cleared even though no new baseline was set.
-
-    This test forces the interleaving deterministically: it hooks _enqueue_multi_write
-    to delete the target run AFTER the read but BEFORE the write executes.
-    The correct behavior is: either set_baseline_run returns None (detecting the
-    deletion) OR the existing baseline is preserved (never left with zero baselines
-    when one existed before, unless the fix returns None to signal failure).
+    The monkeypatch intercepts _enqueue_multi_write and deletes the target row
+    first, simulating a concurrent delete that wins before the compound
+    UPDATE+INSERT runs. The function must detect the missing row (rowcount == 0)
+    and return None rather than crashing or clearing the existing baseline.
     """
     import harness.storage.db as db_mod
 
@@ -409,8 +403,7 @@ def test_set_baseline_run_after_delete_no_stale_read(db_path, monkeypatch):
     original_enqueue_multi = db_mod._enqueue_multi_write
 
     def _intercept_and_delete(statements):
-        # Delete the target run AFTER set_baseline_run has read it but BEFORE
-        # the write executes — this simulates the TOCTOU gap.
+        # Delete the target run before the compound write executes.
         delete_runs([id1])
         return original_enqueue_multi(statements)
 
@@ -418,10 +411,8 @@ def test_set_baseline_run_after_delete_no_stale_read(db_path, monkeypatch):
 
     result = set_baseline_run(id1)
 
-    # The function MUST detect that the row is gone and return None.
-    # The old buggy code would clear the existing baseline (UPDATE SET 0)
-    # and then fail to set a new one, leaving the solver with NO baseline
-    # but returning None only because the post-write SELECT found nothing.
+    # The compound UPDATE matches zero rows (target deleted), so rowcount == 0
+    # and set_baseline_run returns None without disturbing other baselines.
     assert result is None
 
     # Critical invariant: since the operation failed, the OLD baseline must
