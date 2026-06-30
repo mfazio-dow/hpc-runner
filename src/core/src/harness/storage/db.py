@@ -72,6 +72,11 @@ class DBWriter:
             return
         self._queue.put(None)
         self._thread.join(timeout=30)
+        if self._thread.is_alive():
+            logger.error("db_writer.stop_timeout", db_path=self._db_path)
+            raise RuntimeError(
+                f"DBWriter thread did not stop within 30 s (db={self._db_path!r})"
+            )
         self._started = False
 
     def enqueue(self, sql: str, params: tuple = ()) -> Future:

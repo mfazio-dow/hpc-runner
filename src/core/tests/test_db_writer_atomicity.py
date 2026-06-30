@@ -519,6 +519,35 @@ def test_drain_batch_mid_drain_sentinel_flushes_pending(db_path):
     ]
 
 
+def test_stop_raises_on_timeout(db_path):
+    """stop() must raise RuntimeError when the writer thread does not exit within timeout."""
+    from unittest.mock import patch
+
+    from harness.storage.db import DBWriter
+
+    w = DBWriter(db_path)
+    w.start()
+
+    with patch.object(w._thread, "join", return_value=None):
+        with patch.object(w._thread, "is_alive", return_value=True):
+            with pytest.raises(RuntimeError, match="did not stop"):
+                w.stop()
+
+    assert w._started is True
+
+
+def test_stop_resets_started_on_clean_exit(db_path):
+    """Happy path: _started is False and thread is dead after a normal stop()."""
+    from harness.storage.db import DBWriter
+
+    w = DBWriter(db_path)
+    w.start()
+    w.stop()
+
+    assert w._started is False
+    assert w._thread.is_alive() is False
+
+
 def test_stop_with_pending_compound_envelope(db_path):
     """Compound envelopes enqueued before stop() execute before shutdown."""
     from harness.storage.db import _writer
