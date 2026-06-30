@@ -144,6 +144,21 @@ class DBWriter:
         return batch, False
 
     def _execute_batch(self, conn: sqlite3.Connection, batch: list[_WorkItem]) -> None:
+        """Execute all drained work items in a single transaction.
+
+        Design trade-off: all items in a batch share one transaction. This
+        maximizes write throughput (one fsync per drain cycle) but means a
+        single malformed statement will roll back *every* item in the batch,
+        including unrelated writes from other callers that happened to land in
+        the same drain window. This is acceptable because:
+
+        1. All SQL is generated internally (not user-supplied), so failures
+           here indicate bugs, not bad input.
+        2. Futures propagate the exception to every affected caller, making
+           the failure visible rather than silent.
+        3. Per-item commits would serialize fsyncs and negate the throughput
+           benefit of batching.
+        """
         if not batch:
             return
         pending: list[tuple[Future, tuple[int, int]]] = []
