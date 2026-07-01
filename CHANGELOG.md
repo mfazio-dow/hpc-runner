@@ -4,6 +4,37 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **SQLite write concurrency** — Introduced a dedicated `DBWriter` thread with a single-writer queue, eliminating multi-thread SQLite locking errors that surfaced under concurrent API requests.
+- **Atomicity race in multi-statement writes** — Compound writes (e.g. `set_baseline_run`) are now executed in a single transaction; previously separate queue items could interleave with unrelated writes.
+- **Futures resolved before commit** — `DBWriter` batch execution defers all `set_result` calls until after `conn.commit()` succeeds; earlier futures no longer point at phantom rows on rollback.
+- **TOCTOU race in `set_baseline_run`** — Inlined the existence check into the atomic write via SQL subquery so a concurrent delete cannot land between the read and the UPDATE.
+- **Enqueue-after-stop race** — A `_stopped` threading event now causes `enqueue()` / `enqueue_atomic()` to raise `RuntimeError` immediately on a stopped writer, preventing indefinite hangs.
+- **`DBWriter.stop()` silent reset on join timeout** — `stop()` now raises `RuntimeError` if the writer thread is still alive after the join timeout instead of resetting `_started` and allowing a duplicate thread.
+- **Shutdown ordering** — The invocation executor is drained before the `DBWriter` stops, preventing dropped writes from in-flight tasks.
+- **N+1 connection pattern in `get_baseline_comparison`** — Refactored from 1 + 2M connections (M solvers) to a single read-only connection.
+- **WAL mode race window** — `PRAGMA journal_mode=WAL` is now set before DDL in `init_db`, eliminating the window where schema creation ran under rollback-journal mode.
+- **API tests writing to wrong DB** — Introduced an `api_client` fixture that owns the writer lifecycle for the test DB, fixing a singleton writer race where writes silently targeted the wrong path.
+- **Nested `db_writer_session` + TestClient writer conflict** — Restructured tests so the `TestClient` lifespan exclusively owns the writer lifecycle.
+- **Duplicate run-row decoders** — Merged `_run_to_response` and `_normalize_run_row` into a single `decode_run_row` that handles all JSON columns (`scheduler_job_ids`, `scheduler_backend`, `submit_container`).
+- **Dead `None`-check branch in `get_job_batch_uuids`** — Removed unreachable branch; narrowed return type from `list[Any] | None` to `list[str]`.
+- **Incomplete docstring on `api_job_batch_uuids`** endpoint.
+
+### Changed
+
+- **`db_writer_session` context manager** — New public API for safe start/stop writer lifecycle; write functions (`store_run`, `delete_runs`, `set_baseline_run`, `upsert_matrix_preset`, `delete_matrix_preset`) no longer accept a `db_path` parameter.
+- **`DBWriter` queue items** — Refactored from raw tuple discrimination to `@dataclass` types (`_SingleWork` / `_CompoundWork`) with `isinstance` dispatch.
+- **Read-only connections** — `_connect_readonly` now uses SQLite URI `mode=ro`, enforcing read-only at the engine level instead of by convention.
+- **Configurable thread pool** — `HPC_MAX_BACKGROUND_WORKERS` environment variable replaces the hardcoded `max_workers=32` for the invocation executor.
+- **Test isolation** — Uses `monkeypatch.setattr` for executor test isolation; replaces private `_writer` inspection with behavioural assertions; replaces hardcoded `lastrowid` assertions with property-based checks.
+
+### Added
+
+- **`src/core/tests/test_db_writer_atomicity.py`** — Comprehensive test suite for `DBWriter` atomicity, batch semantics, drain-before-stop, and mid-drain invariants.
+
 ## [Released]
 
 ### Documentation
